@@ -1,7 +1,7 @@
 [project]
 name = "glanos-anonymization"
 version = "0.1.0"
-description = "Add your description here"
+description = "Glanos Anonymization Python Library"
 readme = "README.md"
 
 requires-python = ">=3.14"
@@ -34,3 +34,8 @@ dev = [
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-ra -q"
+markers = [
+    "unit: fast, isolated tests - no network, no real API calls",
+    "integration: tests exercising multiple components together, HTTP mocked via httpx.MockTransport",
+    "e2e: tests against the real Glanos API - require GLANOS_TOKEN/GLANOS_BASE_URL to be set (e.g. via .env)",
+]
