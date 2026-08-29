@@ -2,6 +2,7 @@
 name = "glanos-anonymization"
 version = "0.1.0"
 description = "Glanos Anonymization Python Library"
+license = "LicenseRef-Proprietary"
 readme = "README.md"
 
 requires-python = ">=3.14"
