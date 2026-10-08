@@ -1,6 +1,6 @@
 from glanos_anonymization.core import (
     GlanosClient,
-    AnonymizationConfig,
+    AnonymizationSettings,
     PseudoResult,
     FetchKeyData,
     DepseudoPaths,
@@ -10,7 +10,12 @@ from glanos_anonymization.core import (
     FoldMode,
     ImageReplaceMode,
     DownloadOption,
+    SettingsSort,
+    SortOrder,
 )
+from collections.abc import Callable
+from typing import Any
+from pydantic import BaseModel
 import argparse
 import sys
 
@@ -19,9 +24,30 @@ def _choices(enum_cls) -> list[str]:
     return [member.value for member in enum_cls]
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+
+def _add_switch(
+    parser: argparse.ArgumentParser, name: str, dest: str, help_text: str
+) -> None:
+    parser.add_argument(
+        f"--{name}", dest=dest, action="store_true", default=None, help=help_text
+    )
+    parser.add_argument(
+        f"--no{name[0].upper()}{name[1:]}",
+        dest=dest,
+        action="store_false",
+        default=None,
+        help=f"Turn --{name} off",
+    )
+
+
 def _add_ssl_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--ssl-no-verify",
+        "--sslNoVerify",
         action="store_true",
         dest="no_ssl_verify",
         default=None,
@@ -29,25 +55,43 @@ def _add_ssl_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_connection_args(parser: argparse.ArgumentParser) -> None:
+
+    parser.add_argument(
+        "--token",
+        type=str,
+        dest="token",
+        required=True,
+        help="Glanos anonymization.ai API token",
+    )
+    parser.add_argument(
+        "--baseUrl",
+        type=str,
+        dest="base_url",
+        required=True,
+        help="Glanos anonymization.ai base URL",
+    )
+    _add_ssl_arg(parser)
+
+
 def _add_settings_args(parser: argparse.ArgumentParser) -> None:
-    """Inline AnonymizationSettings flags for the 'pseudo' command."""
 
     parser.add_argument(
         "--mode",
         choices=_choices(AnonymizationMode),
         type=str,
         dest="anonymization_mode",
-        default="TYPE",
-        help="Pseudonymization/Anonymization Mode: TYPE: COMPANY1, TYPE_PRESERVING: Jane Doe, XXX: XXX (pure "
+        default=None,
+        help="Pseudonymization/Anonymization Mode (default: TYPE): TYPE: COMPANY1, TYPE_PRESERVING: Jane Doe, XXX: XXX (pure "
         "anonymization, no depseudonymizaton possible), MT: as TYPE_PRESERVING but optimized for machine translation",
     )
 
     parser.add_argument(
-        "--exclude_fields",
+        "--excludeFields",
         choices=_choices(ExcludeField),
         dest="exclude_fields",
         nargs="+",
-        default=[],
+        default=None,
         help="Entities which should not be anonymized (default: none)",
     )
 
@@ -64,8 +108,7 @@ def _add_settings_args(parser: argparse.ArgumentParser) -> None:
         choices=_choices(FoldMode),
         dest="fold_mode",
         default=None,
-        help="Degree to which variations of the same entity are folded to the same anonymization/pseudonym "
-        "(default: server default, MINOR_VAR)",
+        help="Degree to which variations of the same entity are folded to the same anonymization/pseudonym"
     )
 
     parser.add_argument(
@@ -82,7 +125,7 @@ def _add_settings_args(parser: argparse.ArgumentParser) -> None:
         choices=_choices(ImageReplaceMode),
         dest="image_replace",
         default=None,
-        help="How images are replaced: DUMMY, BLANK, TRANSPARENT, AUTO (default: server default, AUTO)",
+        help="How images are replaced: DUMMY, BLANK, TRANSPARENT, AUTO (default: AUTO)",
     )
 
     parser.add_argument(
@@ -97,20 +140,19 @@ def _add_settings_args(parser: argparse.ArgumentParser) -> None:
         "--custom",
         dest="custom",
         nargs="+",
-        default=[],
-        help="Installation-specific custom options (see Glanos support for available options)",
+        default=None,
+        help="Installation-specific custom options (see Glanos anonymization.ai support for available options)",
     )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="glanos-anonymization")
+    parser = _ArgumentParser(prog="glanos-anonymization")
 
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
+        parser_class=_ArgumentParser,
     )
-
-    # --- pseudo ---------------------------------------------------------
 
     pseudo_parser = subparsers.add_parser(
         "pseudo", help="Anonymize/pseudonymize a document"
@@ -128,7 +170,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     pseudo_parser.add_argument(
-        "--filename",
+        "--fileName",
         type=str,
         dest="filename",
         default=None,
@@ -141,7 +183,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         dest="token",
         required=True,
-        help="Glanos Anonymization API Token",
+        help="Glanos anonymization.ai API token",
     )
 
     pseudo_parser.add_argument(
@@ -149,11 +191,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         dest="base_url",
         required=True,
-        help="Anonymization base url",
+        help="Glanos anonymization.ai base URL",
     )
 
     pseudo_parser.add_argument(
-        "--lang",
+        "--language",
         type=str,
         dest="language",
         required=False,
@@ -178,44 +220,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Name of the output file [Required if async is off]",
     )
 
-    pseudo_parser.add_argument(
-        "--returnPseudoKey",
-        dest="return_pseudo_key",
-        action="store_true",
-        default=None,
-        help="[Only if --async=false] Whether to return the pseudo key (default false), data cannot be depseudonymized without pseudo key after pseudoKey retention time",
+    _add_switch(
+        pseudo_parser,
+        "returnPseudoKey",
+        "return_pseudo_key",
+        "[Only without --async] Return the pseudo key and write it to <outputFile>.pkey "
+        "(default: on, so that the document can be restored with --pseudoKeyFile and --encryptKeyFile)",
     )
-
-    pseudo_parser.add_argument(
-        "--returnEncryptKey",
-        dest="return_encrypt_key",
-        action="store_true",
-        default=None,
-        help="[Only if async=false] Whether to return the encryption key (default false), data may then be depseudonymized with pseudo and encryption key after meta data retention time",
+    _add_switch(
+        pseudo_parser,
+        "returnEncryptKey",
+        "return_encrypt_key",
+        "[Only without --async] Return the encryption key and write it to <outputFile>.ekey (default: on)",
     )
 
     pseudo_parser.add_argument(
         "--dataRetentionMS",
         dest="data_retention_ms",
         type=int,
-        default=0,
-        help="Milliseconds to keep document in the database after processing (default 0), -1 for infinite retention",
+        default=None,
+        help="Milliseconds to keep the anonymized document on the server, -1 for infinite retention "
+        "(API default 0: expires right after download)",
     )
 
     pseudo_parser.add_argument(
         "--pseudoKeyRetentionMS",
         dest="pseudo_key_retention_ms",
         type=int,
-        default=0,
-        help="Milliseconds to keep pseudoKey in the database after processing (default 0) - after that any depseudo request must contain the returned pseudoKey, -1 for infinite retention. Only honored for --async requests followed by 'fetch'; a non-async request discards its pseudoKey server-side immediately regardless of this setting, so later 'depseudo --metaKey' needs --pseudoKeyFile (via --returnPseudoKey) instead",
+        default=None,
+        help="Milliseconds to keep the pseudoKey on the server - after that any depseudo request must contain "
+        "the returned pseudoKey, -1 for infinite retention (API default 0: expires right after download)",
     )
 
     pseudo_parser.add_argument(
         "--metaRetentionMS",
         dest="meta_retention_ms",
         type=int,
-        default=0,
-        help="Milliseconds to keep meta data (including encryptKey) in the database after processing (default 0) - after that any depseudo request must contain the returned pseudoKey and the encryptKey, -1 for infinite retention. metaKey-only 'depseudo --metaKey' (via --async + fetch) also needs this set to a positive value together with --pseudoKeyRetentionMS - otherwise the server rejects the depseudo request with 'No such id ...'",
+        default=None,
+        help="Milliseconds to keep the meta data (including encryptKey) on the server - until then "
+        "'depseudo --metaKey' works, after that only --pseudoKeyFile with --encryptKeyFile; -1 for infinite "
+        "retention (API default 0: per spec 1h after download). "
+        "Only for --file: --text requests get no metaKey and are restored with --pseudoKeyFile and --encryptKeyFile",
     )
 
     pseudo_parser.add_argument(
@@ -223,8 +268,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         dest="settings_id",
         default=None,
-        help="Reference to an existing stored setting (ignored if --mode/--exclude_fields/... are also given, "
-        "since inline settings take precedence)",
+        help="ID of a stored setting"
     )
 
     pseudo_parser.add_argument(
@@ -264,13 +308,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--options",
         dest="options",
         nargs="+",
-        default=[],
-        help="Installation-specific custom upload options (see Glanos support for available options)",
+        default=None,
+        help="Installation-specific custom upload options (see Glanos anonymization.ai support for available options)",
     )
 
     _add_settings_args(pseudo_parser)
-
-    # --- fetch ------------------------------------------------------------
 
     fetch_parser = subparsers.add_parser(
         "fetch",
@@ -281,7 +323,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         dest="token",
         required=True,
-        help="Glanos Anonymization token",
+        help="Glanos anonymization.ai API token",
     )
 
     fetch_parser.add_argument(
@@ -305,29 +347,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         dest="base_url",
         required=True,
-        help="Anonymization base url",
+        help="Glanos anonymization.ai base URL",
     )
 
     _add_ssl_arg(fetch_parser)
 
-    fetch_parser.add_argument(
-        "--returnPseudoKey",
-        dest="return_pseudo_key",
-        action="store_true",
-        default=None,
-        help="Whether to return the pseudo key (API default true), data cannot be depseudonymized without pseudo key after pseudoKey retention time",
+    _add_switch(
+        fetch_parser,
+        "returnPseudoKey",
+        "return_pseudo_key",
+        "Return the pseudo key and write it to <outputFile>.pkey (default: on)",
+    )
+    _add_switch(
+        fetch_parser,
+        "returnEncryptKey",
+        "return_encrypt_key",
+        "Return the encryption key and write it to <outputFile>.ekey (default: on)",
     )
 
     fetch_parser.add_argument(
-        "--returnEncryptKey",
-        dest="return_encrypt_key",
-        action="store_true",
-        default=None,
-        help="Whether to return the encryption key (default false), data may then be depseudonymized with pseudo and encryption key after meta data retention time",
-    )
-
-    fetch_parser.add_argument(
-        "--no-start-retention-period",
+        "--noStartRetentionPeriod",
         dest="start_retention_period",
         action="store_false",
         default=None,
@@ -341,8 +380,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional output conversion, e.g. PDF_AS_PDF",
     )
-
-    # --- depseudo -----------------------------------------------------
 
     depseudo_parser = subparsers.add_parser(
         "depseudo", help="Depseudonymize a document"
@@ -360,7 +397,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         dest="token",
         required=True,
-        help="Glanos Anonymization API Token",
+        help="Glanos anonymization.ai API token",
     )
 
     depseudo_parser.add_argument(
@@ -368,7 +405,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         dest="base_url",
         required=True,
-        help="Anonymization base url",
+        help="Glanos anonymization.ai base URL",
     )
 
     depseudo_parser.add_argument(
@@ -377,7 +414,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="pseudo_key_file",
         required=False,
         default=None,
-        help="Provide file with pseudoKey (sufficient on its own; --metaKey is not needed alongside it)",
+        help="File with the pseudoKey (<outputFile>.pkey of 'pseudo'). Together with --encryptKeyFile it always "
+        "restores the document; without it, combine it with --metaKey while the meta data is kept",
     )
 
     depseudo_parser.add_argument(
@@ -386,7 +424,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="encrypt_key_file",
         required=False,
         default=None,
-        help="Optionally provide encryptKey file",
+        help="File with the encryptKey (<outputFile>.ekey of 'pseudo'); use it together with --pseudoKeyFile",
     )
 
     depseudo_parser.add_argument(
@@ -395,11 +433,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="meta_key",
         required=False,
         default=None,
-        help="metaKey as returned by pseudonymization, required unless --pseudoKeyFile or --session is provided. "
-        "Only usable if that document was pseudonymized with --async and BOTH --pseudoKeyRetentionMS and "
-        "--metaRetentionMS set to a positive value (either alone is not enough) - a synchronous pseudo call "
-        "discards its pseudoKey immediately regardless of these settings; use --pseudoKeyFile (from "
-        "--returnPseudoKey) for sync results",
+        help="metaKey as returned by pseudonymization. Only usable while the meta data is kept, i.e. if the "
+        "document was pseudonymized with --metaRetentionMS > 0; otherwise use --pseudoKeyFile with "
+        "--encryptKeyFile, or --session",
     )
 
     depseudo_parser.add_argument(
@@ -412,15 +448,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     depseudo_parser.add_argument(
-        "--filename",
+        "--fileName",
         type=str,
         dest="depseudo_filename",
         required=False,
         default=None,
-        help="fileName to send with the request. The API tracks documents by the fileName it "
-        "originally assigned (printed as 'fileName: ...' by the pseudo/fetch command) - pass "
-        "that here. Defaults to the local --file's basename, which only works if the file was "
-        "not renamed after downloading it.",
+        help="fileName to send with the request"
     )
 
     depseudo_parser.add_argument(
@@ -433,16 +466,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     _add_ssl_arg(depseudo_parser)
 
-    # --- session-remove -----------------------------------------------
-
     session_remove_parser = subparsers.add_parser(
         "session-remove",
         help="Remove a session by id (securely removes its pseudonym mapping)",
     )
-    session_remove_parser.add_argument("--token", type=str, dest="token", required=True)
-    session_remove_parser.add_argument(
-        "--baseUrl", type=str, dest="base_url", required=True
-    )
+    _add_connection_args(session_remove_parser)
     session_remove_parser.add_argument(
         "--session",
         type=str,
@@ -450,7 +478,173 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="ID of the session",
     )
-    _add_ssl_arg(session_remove_parser)
+
+    session_add_parser = subparsers.add_parser(
+        "session-add",
+        help="Create a session for consistent pseudonyms across multiple requests",
+    )
+    _add_connection_args(session_add_parser)
+    session_add_parser.add_argument(
+        "--maxAgeSeconds",
+        type=int,
+        dest="max_age_seconds",
+        required=True,
+        help="Lifetime of the session in SECONDS",
+    )
+    session_add_parser.add_argument(
+        "--name", type=str, dest="session_name", default=None, help="Session name"
+    )
+    session_add_parser.add_argument(
+        "--settingsId",
+        type=str,
+        dest="session_settings_id",
+        required=True,
+        help="ID of the stored setting the session is based on (see setting-add)",
+    )
+    session_add_parser.add_argument(
+        "--shareUsers",
+        dest="share_users",
+        nargs="+",
+        default=None,
+        help="Users allowed to use the session",
+    )
+    session_add_parser.add_argument(
+        "--shareGroups",
+        dest="share_groups",
+        nargs="+",
+        default=None,
+        help="Groups allowed to use the session",
+    )
+
+    session_get_parser = subparsers.add_parser(
+        "session-get", help="Show a session by id"
+    )
+    _add_connection_args(session_get_parser)
+    session_get_parser.add_argument(
+        "--session",
+        type=str,
+        dest="session_id",
+        required=True,
+        help="ID of the session",
+    )
+
+    session_extend_parser = subparsers.add_parser(
+        "session-extend",
+        help="Set a session's expiration to now plus --maxAgeSeconds",
+    )
+    _add_connection_args(session_extend_parser)
+    session_extend_parser.add_argument(
+        "--session",
+        type=str,
+        dest="session_id",
+        required=True,
+        help="ID of the session",
+    )
+    session_extend_parser.add_argument(
+        "--maxAgeSeconds",
+        type=int,
+        dest="max_age_seconds",
+        required=True,
+        help="New lifetime from now on, in SECONDS",
+    )
+
+    setting_get_parser = subparsers.add_parser(
+        "setting-get", help="Show a stored setting by id"
+    )
+    _add_connection_args(setting_get_parser)
+    setting_get_parser.add_argument(
+        "--setting",
+        type=str,
+        dest="setting_id",
+        required=True,
+        help="ID of the setting",
+    )
+
+    setting_list_parser = subparsers.add_parser(
+        "setting-list", help="List stored settings"
+    )
+    _add_connection_args(setting_list_parser)
+    setting_list_parser.add_argument(
+        "--query",
+        type=str,
+        dest="query",
+        default=None,
+        help="Fuzzy match on setting name",
+    )
+    setting_list_parser.add_argument(
+        "--creator",
+        dest="creator",
+        nargs="+",
+        default=None,
+        help="One or more setting creators (the setting still has to be shared with the API user)",
+    )
+    setting_list_parser.add_argument(
+        "--sort", choices=_choices(SettingsSort), dest="sort", default=None
+    )
+    setting_list_parser.add_argument(
+        "--sortOrder", choices=_choices(SortOrder), dest="sort_order", default=None
+    )
+    setting_list_parser.add_argument(
+        "--limit",
+        type=int,
+        dest="limit",
+        default=None,
+        help="Maximum number of matches (API default 10)",
+    )
+    setting_list_parser.add_argument(
+        "--offset",
+        type=int,
+        dest="offset",
+        default=None,
+        help="0-based pagination offset",
+    )
+
+    setting_create_parser = subparsers.add_parser(
+        "setting-add",
+        help="Store a new setting (the server assigns its ID, printed in the result)",
+    )
+    _add_connection_args(setting_create_parser)
+    setting_create_parser.add_argument(
+        "--name",
+        type=str,
+        dest="setting_name",
+        required=True,
+        help="Name of the setting",
+    )
+    _add_settings_args(setting_create_parser)
+
+    setting_update_parser = subparsers.add_parser(
+        "setting-update",
+        help="Change a stored setting",
+    )
+    _add_connection_args(setting_update_parser)
+    setting_update_parser.add_argument(
+        "--setting",
+        type=str,
+        dest="setting_id",
+        required=True,
+        help="ID of the setting to change",
+    )
+    setting_update_parser.add_argument(
+        "--name",
+        type=str,
+        dest="setting_name",
+        default=None,
+        help="New name of the setting",
+    )
+    _add_settings_args(setting_update_parser)
+
+    setting_remove_parser = subparsers.add_parser(
+        "setting-remove", help="Remove a stored setting by id"
+    )
+    _add_connection_args(setting_remove_parser)
+    setting_remove_parser.add_argument(
+        "--setting",
+        type=str,
+        dest="setting_id",
+        required=True,
+        help="ID of the setting",
+    )
 
     args = parser.parse_args(argv)
 
@@ -479,45 +673,66 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def create_ano_config(args: argparse.Namespace) -> AnonymizationConfig:
-    """
-    Build an AnonymizationConfig from parsed CLI arguments.
+_SETTINGS_FLAGS = {
+    "anonymization_mode": "mode",
+    "exclude_fields": "excludeFields",
+    "workflow": "workflow",
+    "fold_mode": "foldMode",
+    "blank_out_mode": "blankOutMode",
+    "image_replace": "imageReplace",
+    "add_no_translate_markup": "addNoTranslateMarkup",
+    "custom": "custom",
+}
 
-    Only known AnonymizationConfig fields are forwarded; unrelated CLI
-    arguments (token, base_url, file, ...) are ignored explicitly rather
-    than relying on the model silently discarding unknown fields.
-    """
 
-    config_fields = set(AnonymizationConfig.model_fields)
-    config_kwargs = {
-        k: v
-        for k, v in vars(args).items()
-        if k in config_fields and k != "a_sync" and v is not None
+def given_settings_fields(args: argparse.Namespace) -> dict:
+
+    return {
+        field: getattr(args, dest)
+        for dest, field in _SETTINGS_FLAGS.items()
+        if getattr(args, dest, None) is not None
     }
 
-    # Only the 'pseudo' command exposes --async; other commands always
-    # request the completed result, so default a_sync to False for them.
-    config_kwargs["a_sync"] = bool(getattr(args, "a_sync", False))
 
-    return AnonymizationConfig(**config_kwargs)
+def build_inline_settings(args: argparse.Namespace) -> AnonymizationSettings | None:
+
+    given = given_settings_fields(args)
+    return AnonymizationSettings(**given) if given else None
 
 
 def exec_command(args: argparse.Namespace) -> None:
-    ano_config = create_ano_config(args)
-
     with GlanosClient(
-        token=args.token, base_url=args.base_url, config=ano_config
+        token=args.token,
+        base_url=args.base_url,
+        no_ssl_verify=bool(args.no_ssl_verify),
     ) as glanos_client:
         match args.command:
             case "pseudo":
+                request = {
+                    "filename": args.filename,
+                    "settings": build_inline_settings(args),
+                    "settings_id": args.settings_id,
+                    "session": args.session,
+                    "session_max_age": args.session_max_age,
+                    "a_sync": args.a_sync,
+                    "return_pseudo_key": args.return_pseudo_key,
+                    "return_encrypt_key": args.return_encrypt_key,
+                    "language": args.language,
+                    "data_retention_ms": args.data_retention_ms,
+                    "pseudo_key_retention_ms": args.pseudo_key_retention_ms,
+                    "meta_retention_ms": args.meta_retention_ms,
+                    "assignee": args.assignee,
+                    "assigned_group": args.assigned_group,
+                    "options": args.options,
+                }
                 try:
                     if args.file:
                         pseudo_result = glanos_client.pseudo_sync(
-                            path=args.file, filename=args.filename
+                            path=args.file, **request
                         )
                     else:
                         pseudo_result = glanos_client.pseudo_sync(
-                            text=args.text, filename=args.filename
+                            text=args.text, **request
                         )
                 except Exception as e:
                     print(f"Error while executing pseudo command: {e}", file=sys.stderr)
@@ -571,16 +786,96 @@ def exec_command(args: argparse.Namespace) -> None:
                 glanos_client.manage_data(depseudo_result, output_file=args.output_file)
 
             case "session-remove":
-                try:
-                    result = glanos_client.remove_session(args.session_id)
-                except Exception as e:
-                    print(
-                        f"Error while executing session-remove command: {e}",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
+                _print_result(
+                    args.command, lambda: glanos_client.remove_session(args.session_id)
+                )
 
-                print(result.model_dump_json())
+            case "session-add":
+                _print_result(
+                    args.command,
+                    lambda: glanos_client.add_session(
+                        args.max_age_seconds,
+                        name=args.session_name,
+                        settings_id=args.session_settings_id,
+                        share_users=args.share_users,
+                        share_groups=args.share_groups,
+                    ),
+                )
+
+            case "session-get":
+                _print_result(
+                    args.command, lambda: glanos_client.get_session(args.session_id)
+                )
+
+            case "session-extend":
+                _print_result(
+                    args.command,
+                    lambda: glanos_client.extend_session(
+                        args.session_id, args.max_age_seconds
+                    ),
+                )
+
+            case "setting-get":
+                _print_result(
+                    args.command, lambda: glanos_client.get_setting(args.setting_id)
+                )
+
+            case "setting-list":
+                _print_result(
+                    args.command,
+                    lambda: glanos_client.list_settings(
+                        query=args.query,
+                        creator=args.creator,
+                        sort=args.sort,
+                        sort_order=args.sort_order,
+                        limit=args.limit,
+                        offset=args.offset,
+                    ),
+                )
+
+            case "setting-add":
+                settings = AnonymizationSettings(
+                    name=args.setting_name, **given_settings_fields(args)
+                )
+                _print_result(
+                    args.command,
+                    lambda: glanos_client.add_setting(settings),
+                )
+
+            case "setting-update":
+                _print_result(
+                    args.command,
+                    lambda: update_setting(glanos_client, args),
+                )
+
+            case "setting-remove":
+                _print_result(
+                    args.command, lambda: glanos_client.remove_setting(args.setting_id)
+                )
+
+
+def update_setting(
+    glanos_client: GlanosClient, args: argparse.Namespace
+) -> AnonymizationSettings:
+
+    current = glanos_client.get_setting(args.setting_id)
+    changes = given_settings_fields(args)
+    if args.setting_name is not None:
+        changes["name"] = args.setting_name
+    updated = AnonymizationSettings.model_validate(
+        {**current.model_dump(mode="json"), **changes, "id": args.setting_id}
+    )
+    return glanos_client.update_setting(updated)
+
+
+def _print_result(command: str, call: Callable[[], BaseModel]) -> None:
+    try:
+        result = call()
+    except Exception as e:
+        print(f"Error while executing {command} command: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(result.model_dump_json())
 
 
 def main(argv: list[str] | None = None) -> None:
