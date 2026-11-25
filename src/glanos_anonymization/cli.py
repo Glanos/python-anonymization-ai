@@ -2,7 +2,8 @@ from glanos_anonymization.core import (
     GlanosClient,
     AnonymizationSettings,
     PseudoResult,
-    FetchKeyData,
+    InnerResponseData,
+    Processing,
     DepseudoPaths,
     AnonymizationMode,
     ExcludeField,
@@ -14,10 +15,16 @@ from glanos_anonymization.core import (
     SortOrder,
 )
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from pydantic import BaseModel
 import argparse
+import base64
+import os
 import sys
+
+TOKEN_ENV_VAR = "GLANOS_TOKEN"
+BASE_URL_ENV_VAR = "GLANOS_BASE_URL"
 
 
 def _choices(enum_cls) -> list[str]:
@@ -57,21 +64,48 @@ def _add_ssl_arg(parser: argparse.ArgumentParser) -> None:
 
 def _add_connection_args(parser: argparse.ArgumentParser) -> None:
 
+    # Read from the environment when the flag is left out, so that the token
+    # does not have to appear in the shell history or the process list.
+    token = os.environ.get(TOKEN_ENV_VAR) or None
+    base_url = os.environ.get(BASE_URL_ENV_VAR) or None
     parser.add_argument(
         "--token",
         type=str,
         dest="token",
-        required=True,
-        help="Glanos anonymization.ai API token",
+        required=token is None,
+        default=token,
+        help=f"Glanos anonymization.ai API token (default: ${TOKEN_ENV_VAR})",
     )
     parser.add_argument(
         "--baseUrl",
         type=str,
         dest="base_url",
-        required=True,
-        help="Glanos anonymization.ai base URL",
+        required=base_url is None,
+        default=base_url,
+        help=f"Glanos anonymization.ai base URL (default: ${BASE_URL_ENV_VAR})",
     )
     _add_ssl_arg(parser)
+
+
+def _add_polling_args(
+    parser: argparse.ArgumentParser, defaults: tuple[str, str], applies_to: str = ""
+) -> None:
+    parser.add_argument(
+        "--pollInterval",
+        type=float,
+        dest="poll_interval",
+        default=None,
+        help=f"{applies_to}Seconds between two checks whether the document is ready "
+        f"(default: {defaults[0]})",
+    )
+    parser.add_argument(
+        "--maxAttempts",
+        type=int,
+        dest="max_attempts",
+        default=None,
+        help=f"{applies_to}How often to check before giving up and printing the "
+        f"fetchKey (default: {defaults[1]})",
+    )
 
 
 def _add_settings_args(parser: argparse.ArgumentParser) -> None:
@@ -108,7 +142,7 @@ def _add_settings_args(parser: argparse.ArgumentParser) -> None:
         choices=_choices(FoldMode),
         dest="fold_mode",
         default=None,
-        help="Degree to which variations of the same entity are folded to the same anonymization/pseudonym"
+        help="Degree to which variations of the same entity are folded to the same anonymization/pseudonym",
     )
 
     parser.add_argument(
@@ -178,21 +212,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Required by the API even for --text uploads; defaults to 'plain_text.txt' there.",
     )
 
-    pseudo_parser.add_argument(
-        "--token",
-        type=str,
-        dest="token",
-        required=True,
-        help="Glanos anonymization.ai API token",
-    )
-
-    pseudo_parser.add_argument(
-        "--baseUrl",
-        type=str,
-        dest="base_url",
-        required=True,
-        help="Glanos anonymization.ai base URL",
-    )
+    _add_connection_args(pseudo_parser)
 
     pseudo_parser.add_argument(
         "--language",
@@ -202,36 +222,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="ISO-639 code of document language",
     )
 
-    _add_ssl_arg(pseudo_parser)
-
     pseudo_parser.add_argument(
-        "--async",
-        dest="a_sync",
-        action="store_true",
+        "--processing",
+        choices=_choices(Processing),
+        dest="processing",
         default=None,
-        help="Whether request should respond immediately with fetchKey for async fetching (default false). Note that the request will continue async if request timed out",
+        help="How to wait for the result (default: sync for --text, poll for --file): "
+        "sync: one request that waits for the document; poll: submit, then check "
+        "until it is ready; no_wait: submit and print the fetchKey at once. If the "
+        "document is not ready in time, the fetchKey is printed: collect it with 'fetch'",
     )
+
+    _add_polling_args(pseudo_parser, ("10", "30"), "[Only with --processing poll] ")
 
     pseudo_parser.add_argument(
         "--outputFile",
         type=str,
         dest="output_file",
         required=False,
-        help="Name of the output file [Required if async is off]",
+        help="Name of the output file [Required unless the document is only submitted: "
+        "--processing no_wait, --assignee, --assignedGroup]",
     )
 
     _add_switch(
         pseudo_parser,
         "returnPseudoKey",
         "return_pseudo_key",
-        "[Only without --async] Return the pseudo key and write it to <outputFile>.pkey "
+        "[Only when waiting for the result] Return the pseudo key and write it to <outputFile>.pkey "
         "(default: on, so that the document can be restored with --pseudoKeyFile and --encryptKeyFile)",
     )
     _add_switch(
         pseudo_parser,
         "returnEncryptKey",
         "return_encrypt_key",
-        "[Only without --async] Return the encryption key and write it to <outputFile>.ekey (default: on)",
+        "[Only when waiting for the result] Return the encryption key and write it to <outputFile>.ekey "
+        "(default: on)",
     )
 
     pseudo_parser.add_argument(
@@ -268,7 +293,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         dest="settings_id",
         default=None,
-        help="ID of a stored setting"
+        help="ID of a stored setting",
     )
 
     pseudo_parser.add_argument(
@@ -276,7 +301,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         dest="assignee",
         default=None,
-        help="User-id (usually lower-cased email) to assign this document to for dashboard review",
+        help="User-id (usually lower-cased email) to assign this document to for dashboard review. "
+        "The document is only submitted and the fetchKey printed; collect it with 'fetch' after the review",
     )
 
     pseudo_parser.add_argument(
@@ -284,7 +310,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         dest="assigned_group",
         default=None,
-        help="Group-id to assign this document to for dashboard review (ignored if --assignee is also given)",
+        help="Group-id to assign this document to for dashboard review (instead of --assignee). "
+        "The document is only submitted and the fetchKey printed; collect it with 'fetch' after the review",
     )
 
     pseudo_parser.add_argument(
@@ -298,7 +325,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     pseudo_parser.add_argument(
         "--sessionMaxAge",
         type=int,
-        dest="session_max_age",
+        dest="session_max_age_ms",
         default=None,
         help="If >0 and --session is not given, creates a session with this expiration age (ms) "
         "that stores the pseudonym mapping for consistent pseudonyms across requests",
@@ -318,13 +345,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "fetch",
         help="Fetch the pseudonymization result of an already uploaded document",
     )
-    fetch_parser.add_argument(
-        "--token",
-        type=str,
-        dest="token",
-        required=True,
-        help="Glanos anonymization.ai API token",
-    )
+    _add_connection_args(fetch_parser)
 
     fetch_parser.add_argument(
         "--fetchKey",
@@ -334,6 +355,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="FetchKey from Pseudo Request",
     )
 
+    _add_polling_args(fetch_parser, ("300", "no limit"))
+
     fetch_parser.add_argument(
         "--outputFile",
         type=str,
@@ -341,16 +364,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Name of the output file",
     )
-
-    fetch_parser.add_argument(
-        "--baseUrl",
-        type=str,
-        dest="base_url",
-        required=True,
-        help="Glanos anonymization.ai base URL",
-    )
-
-    _add_ssl_arg(fetch_parser)
 
     _add_switch(
         fetch_parser,
@@ -392,21 +405,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path of file to be depseudoanonymized",
     )
 
-    depseudo_parser.add_argument(
-        "--token",
-        type=str,
-        dest="token",
-        required=True,
-        help="Glanos anonymization.ai API token",
-    )
-
-    depseudo_parser.add_argument(
-        "--baseUrl",
-        type=str,
-        dest="base_url",
-        required=True,
-        help="Glanos anonymization.ai base URL",
-    )
+    _add_connection_args(depseudo_parser)
 
     depseudo_parser.add_argument(
         "--pseudoKeyFile",
@@ -453,7 +452,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="depseudo_filename",
         required=False,
         default=None,
-        help="fileName to send with the request"
+        help="fileName to send with the request",
     )
 
     depseudo_parser.add_argument(
@@ -463,8 +462,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Name of the output file",
     )
-
-    _add_ssl_arg(depseudo_parser)
 
     session_remove_parser = subparsers.add_parser(
         "session-remove",
@@ -650,15 +647,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     match args.command:
         case "pseudo":
-            if args.a_sync:
-                if args.return_pseudo_key or args.return_encrypt_key:
-                    pseudo_parser.error(
-                        "Async mode has to be turned off to return pseudo or encryption key!"
-                    )
-            elif not args.output_file:
-                pseudo_parser.error(
-                    "An output filename has to be specified when async mode is off."
-                )
+            _check_pseudo_args(pseudo_parser, args)
         case "depseudo":
             if not (
                 args.depseudo_session
@@ -671,6 +660,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 )
 
     return args
+
+
+def _check_pseudo_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    polling_given = args.poll_interval is not None or args.max_attempts is not None
+    keys_given = (
+        args.return_pseudo_key is not None or args.return_encrypt_key is not None
+    )
+
+    if args.assignee is not None or args.assigned_group is not None:
+        if args.assignee is not None and args.assigned_group is not None:
+            parser.error("Pass either --assignee or --assignedGroup, not both.")
+        if args.processing is not None or polling_given:
+            parser.error(
+                "A document for review is only submitted: --processing, --pollInterval "
+                "and --maxAttempts do not apply. Collect it with 'fetch' after the review."
+            )
+        waits = False
+    else:
+        processing = args.processing or (
+            Processing.SYNC if args.text is not None else Processing.POLL
+        )
+        if polling_given and processing != Processing.POLL:
+            parser.error(
+                "--pollInterval and --maxAttempts only apply to --processing poll."
+            )
+        waits = processing != Processing.NO_WAIT
+
+    if not waits and keys_given:
+        parser.error(
+            "The document is only submitted, so its keys are requested by 'fetch': "
+            "pass --returnPseudoKey/--returnEncryptKey there."
+        )
+    if waits and not args.output_file:
+        parser.error(
+            "An output filename has to be specified unless the document is only "
+            "submitted (--processing no_wait, --assignee, --assignedGroup)."
+        )
 
 
 _SETTINGS_FLAGS = {
@@ -713,38 +741,45 @@ def exec_command(args: argparse.Namespace) -> None:
                     "settings": build_inline_settings(args),
                     "settings_id": args.settings_id,
                     "session": args.session,
-                    "session_max_age": args.session_max_age,
-                    "a_sync": args.a_sync,
-                    "return_pseudo_key": args.return_pseudo_key,
-                    "return_encrypt_key": args.return_encrypt_key,
+                    "session_max_age_ms": args.session_max_age_ms,
                     "language": args.language,
                     "data_retention_ms": args.data_retention_ms,
                     "pseudo_key_retention_ms": args.pseudo_key_retention_ms,
                     "meta_retention_ms": args.meta_retention_ms,
-                    "assignee": args.assignee,
-                    "assigned_group": args.assigned_group,
                     "options": args.options,
                 }
+                if args.file:
+                    request["path"] = args.file
+                else:
+                    request["text"] = args.text
                 try:
-                    if args.file:
-                        pseudo_result = glanos_client.pseudo_sync(
-                            path=args.file, **request
+                    if args.assignee is not None or args.assigned_group is not None:
+                        result = glanos_client.anonymize_with_review(
+                            assignee=args.assignee,
+                            assigned_group=args.assigned_group,
+                            **request,
                         )
                     else:
-                        pseudo_result = glanos_client.pseudo_sync(
-                            text=args.text, **request
+                        result = glanos_client.anonymize(
+                            processing=args.processing,
+                            poll_interval=args.poll_interval,
+                            max_attempts=args.max_attempts,
+                            return_pseudo_key=args.return_pseudo_key,
+                            return_encrypt_key=args.return_encrypt_key,
+                            **request,
                         )
                 except Exception as e:
                     print(f"Error while executing pseudo command: {e}", file=sys.stderr)
                     sys.exit(1)
 
-                glanos_client.manage_data(pseudo_result, output_file=args.output_file)
+                manage_data(result.pseudo_result, output_file=args.output_file)
 
             case "fetch":
-                pseudo_result = PseudoResult(
-                    success=True, data=FetchKeyData(fetchKey=args.fetch_key)
-                )
                 fetch_kwargs = {}
+                if args.poll_interval is not None:
+                    fetch_kwargs["poll_interval"] = args.poll_interval
+                if args.max_attempts is not None:
+                    fetch_kwargs["max_attempts"] = args.max_attempts
                 if args.return_pseudo_key is not None:
                     fetch_kwargs["return_pseudo_key"] = args.return_pseudo_key
                 if args.return_encrypt_key is not None:
@@ -757,12 +792,12 @@ def exec_command(args: argparse.Namespace) -> None:
                     )
 
                 try:
-                    fetch_result = glanos_client.fetch(pseudo_result, **fetch_kwargs)
+                    fetch_result = glanos_client.fetch(args.fetch_key, **fetch_kwargs)
                 except Exception as e:
                     print(f"Error while executing fetch command: {e}", file=sys.stderr)
                     sys.exit(1)
 
-                glanos_client.manage_data(fetch_result, args.output_file)
+                manage_data(fetch_result.pseudo_result, args.output_file)
 
             case "depseudo":
                 try:
@@ -771,11 +806,11 @@ def exec_command(args: argparse.Namespace) -> None:
                         meta_key=args.meta_key,
                         encrypt_key_path=args.encrypt_key_file,
                     )
-                    depseudo_result = glanos_client.depseudo(
-                        args.file,
-                        depseudo_paths,
-                        session=args.depseudo_session,
+                    depseudo_result = glanos_client.deanonymize(
+                        path=args.file,
                         filename=args.depseudo_filename,
+                        session=args.depseudo_session,
+                        depseudo_paths=depseudo_paths,
                     )
                 except Exception as e:
                     print(
@@ -783,7 +818,7 @@ def exec_command(args: argparse.Namespace) -> None:
                     )
                     sys.exit(1)
 
-                glanos_client.manage_data(depseudo_result, output_file=args.output_file)
+                manage_data(depseudo_result.pseudo_result, output_file=args.output_file)
 
             case "session-remove":
                 _print_result(
@@ -852,6 +887,68 @@ def exec_command(args: argparse.Namespace) -> None:
                 _print_result(
                     args.command, lambda: glanos_client.remove_setting(args.setting_id)
                 )
+
+
+def write_to_output(
+    data: str | bytes,
+    output_file: str | Path,
+    extension: str | None = None,
+    mode: str = "w",
+) -> None:
+
+    path = Path(output_file)
+    if extension:
+        path = path.with_suffix(f".{extension}")
+
+    with open(path, mode=mode) as f:
+        f.write(data)
+
+
+def write_key_file(output_file: str | Path, extension: str, key: str) -> Path:
+    """Write a restoration key next to the output file, readable by its owner only."""
+
+    path = Path(output_file).with_suffix(f".{extension}")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        # os.open applies the mode only to new files
+        os.chmod(path, 0o600)
+        f.write(key)
+    return path
+
+
+def manage_data(
+    pseudo_result: PseudoResult, output_file: str | Path | None = None
+) -> None:
+
+    data = pseudo_result.data
+    if not isinstance(data, InnerResponseData):
+        print(
+            "The document is not processed yet. Collect it later with: "
+            f"glanos-anonymization fetch --fetchKey {data.fetchKey} --outputFile <file>",
+            file=sys.stderr,
+        )
+        print(data.model_dump_json())
+        return
+
+    content = base64.b64decode(data.data)
+    write_to_output(content, output_file=output_file, mode="wb")
+
+    print(f"metaKey: {data.metaKey}")
+    print(f"fileName (in server): {data.fileName}")
+    print(f"fileName (in output): {Path(output_file).name}")
+    if data.session is not None:
+        print(f"session: {data.session}")
+
+    # The keys restore the document, so they are written to files only and
+    # never printed.
+    for label, key, extension in (
+        ("pseudoKey", data.pseudoKey, "pkey"),
+        ("encryptKey", data.encryptKey, "ekey"),
+    ):
+        if key is not None:
+            print(f"{label} written to {write_key_file(output_file, extension, key)}")
+
+    print(f"{output_file} (SZ: {len(content)})")
 
 
 def update_setting(

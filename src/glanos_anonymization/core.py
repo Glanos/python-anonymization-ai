@@ -1,9 +1,10 @@
 import os
+import asyncio
 import base64
 import builtins
+import dataclasses
+import functools
 import math
-import random
-import sys
 import httpx
 from enum import Enum
 from typing import Annotated, Literal, Union, Protocol
@@ -11,14 +12,24 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pathlib import Path
 import json
 import tempfile
-from markitdown import MarkItDown
 import time
 
 DEFAULT_TIMEOUT = 30.0
-DEFAULT_FETCH_MAX_RETRIES = 30
-DEFAULT_FETCH_POLL_INTERVAL = (1.0, 2.0)
+# anonymize(processing="poll"): enough for the server to process a document
+DEFAULT_POLL_INTERVAL = 10.0
+DEFAULT_POLL_MAX_ATTEMPTS = 30
+# fetch(): long enough for a person to review a document
+DEFAULT_FETCH_POLL_INTERVAL = 300.0
+DEFAULT_FETCH_MAX_ATTEMPTS = None
 
 API_BASE_PATH = "/be/api-v2"
+
+
+def _missing_extra(feature: str, extra: str) -> ImportError:
+    return ImportError(
+        f"{feature} needs the optional '{extra}' dependencies: "
+        f"pip install 'glanos-anonymization[{extra}]'"
+    )
 
 
 class GlanosClientError(Exception):
@@ -29,8 +40,13 @@ class DepseudoKeyFileError(GlanosClientError):
     pass
 
 
-class FetchTimeoutError(GlanosClientError):
-    pass
+class ResultNotReadyError(GlanosClientError):
+    def __init__(self, fetch_key: str) -> None:
+        super().__init__(
+            "The document is not processed yet; collect it with "
+            f"fetch() and its fetch_key {fetch_key!r}"
+        )
+        self.fetch_key = fetch_key
 
 
 class SettingNotFoundError(GlanosClientError):
@@ -152,9 +168,16 @@ class DownloadOption(str, Enum):
     PDF_AS_PDF = "PDF_AS_PDF"
 
 
-class OutputMode(str, Enum):
-    RAW = "raw"
-    JSON = "json"
+class Processing(str, Enum):
+    """How anonymize() waits for the anonymized document."""
+
+    # One request that waits for the document; pending if the server
+    # did not finish in time.
+    SYNC = "sync"
+    # Submit, then poll until the document is ready or the attempts run out.
+    POLL = "poll"
+    # Submit and return at once with the fetch key.
+    NO_WAIT = "no_wait"
 
 
 class SettingsSort(str, Enum):
@@ -353,9 +376,31 @@ class DepseudoPaths(BaseModel):
 
 
 class AnonymizationResult:
-    def __init__(self, text: str, pseudo_result: PseudoResult):
-        self.text = text
+    """The document returned by the API, with the keys to restore it.
+
+    The document is kept as returned: `data` holds its bytes. Its text is only
+    extracted when `extract_text()` is called.
+
+    A result can be pending (`ready` is False): the server has not finished
+    the document yet. It then only carries the `fetch_key` to collect it with
+    `fetch()`; reading anything else raises ResultNotReadyError.
+    """
+
+    def __init__(
+        self,
+        pseudo_result: PseudoResult,
+        text_extractor: "TextExtractor | None" = None,
+    ):
         self.pseudo_result = pseudo_result
+        self._text_extractor = text_extractor
+
+    @property
+    def ready(self) -> bool:
+        return isinstance(self.pseudo_result.data, InnerResponseData)
+
+    @property
+    def fetch_key(self) -> str | None:
+        return self.pseudo_result.data.fetchKey
 
     @property
     def data(self) -> bytes:
@@ -365,10 +410,38 @@ class AnonymizationResult:
     def file_name(self) -> str:
         return self._completed_data().fileName
 
+    @property
+    def pseudo_key(self) -> str | None:
+        return self._completed_data().pseudoKey
+
+    @property
+    def encrypt_key(self) -> str | None:
+        return self._completed_data().encryptKey
+
+    @property
+    def meta_key(self) -> str | None:
+        return self._completed_data().metaKey
+
+    @property
+    def session(self) -> str | None:
+        return self._completed_data().session
+
+    def extract_text(self, extractor: "TextExtractor | None" = None) -> str:
+        """Return the text of the document.
+
+        Text results are decoded directly; other documents go through
+        `extractor`, else the client's text extractor (MarkItDown by default).
+        """
+        data = self._completed_data()
+        if _is_text_file(data.fileName):
+            return _decode_text(data.data)
+        extractor = extractor or self._text_extractor or _default_text_extractor()
+        return extractor.extract_text(self.pseudo_result)
+
     def _completed_data(self) -> "InnerResponseData":
         data = self.pseudo_result.data
         if not isinstance(data, InnerResponseData):
-            raise ValueError("pseudo_result does not contain a completed result")
+            raise ResultNotReadyError(data.fetchKey)
         return data
 
 
@@ -382,6 +455,13 @@ class TextExtractor(Protocol):
 
 class MarkItDownTextExtractor(TextExtractor):
     def __init__(self):
+        try:
+            from markitdown import MarkItDown
+        except ImportError as exc:
+            raise _missing_extra(
+                "Extracting text from documents", "text-extraction"
+            ) from exc
+
         self.mid = MarkItDown()
 
     def extract_text(self, pseudo_result: PseudoResult) -> str:
@@ -395,6 +475,21 @@ class MarkItDownTextExtractor(TextExtractor):
             text_content = self.mid.convert(tmp.name).text_content
 
         return text_content
+
+
+@functools.cache
+def _default_text_extractor() -> TextExtractor:
+    return MarkItDownTextExtractor()
+
+
+def _is_text_file(file_name: str) -> bool:
+    return Path(file_name).suffix.lower() == ".txt"
+
+
+def _decode_text(data: str) -> str:
+    # Returned as the API sends it: every plain-text result ends with a newline,
+    # whether or not the input had one.
+    return base64.b64decode(data).decode("utf-8")
 
 
 def _input_data(
@@ -429,6 +524,13 @@ def _is_plain_text(data: "InnerResponseData") -> bool:
     )
 
 
+def _check_polling(poll_interval: float, max_attempts: int | None) -> None:
+    if poll_interval < 0:
+        raise ValueError("poll_interval must not be negative")
+    if max_attempts is not None and max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1, or None for no limit")
+
+
 def _default_keys(
     return_pseudo_key: bool | None, return_encrypt_key: bool | None
 ) -> tuple[bool, bool]:
@@ -438,7 +540,38 @@ def _default_keys(
     )
 
 
-class GlanosClient:
+@dataclasses.dataclass(frozen=True)
+class _ApiRequest:
+    method: str
+    url: str
+    params: dict
+    json_body: dict | None = None
+
+    def httpx_kwargs(self) -> dict:
+        kwargs: dict = {"params": self.params}
+        if self.json_body is not None:
+            kwargs["content"] = json.dumps(self.json_body)
+            kwargs["headers"] = {"Content-Type": "application/json"}
+        return kwargs
+
+
+class _GlanosClientBase:
+    """Builds the API requests and parses the responses.
+
+    GlanosClient and AsyncGlanosClient share all of it and only add how a
+    request is sent; each of their methods is: build the request, send it,
+    parse the response.
+    """
+
+    # For a text the server did not finish within a sync request: fetch() it
+    # like anonymize(processing="poll") would, without the keys.
+    _COLLECT_IN_TIME = {
+        "poll_interval": DEFAULT_POLL_INTERVAL,
+        "max_attempts": DEFAULT_POLL_MAX_ATTEMPTS,
+        "return_pseudo_key": False,
+        "return_encrypt_key": False,
+    }
+
     _STATUS_EXCEPTIONS: dict[int, type[GlanosAPIError]] = {
         401: AuthenticationError,
         402: QuotaExceededError,
@@ -452,43 +585,18 @@ class GlanosClient:
         token: str,
         base_url: str,
         text_extractor: TextExtractor | None = None,
-        timeout: float = DEFAULT_TIMEOUT,
-        transport: httpx.BaseTransport | None = None,
-        no_ssl_verify: bool = False,
     ) -> None:
         self.token = token
         self.base_url = base_url.rstrip("/")
-        self._client: httpx.Client | None = httpx.Client(
-            verify=not no_ssl_verify,
-            timeout=timeout,
-            transport=transport,
-        )
         self.text_extractor = text_extractor
 
-    def __enter__(self) -> "GlanosClient":
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
-
-    def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
-            self._client = None
-
     @property
-    def client(self) -> httpx.Client:
-        return self._client
-
-    @property
-    def text_extractor(self):
-        return self._text_extractor
+    def text_extractor(self) -> TextExtractor:
+        return self._text_extractor or _default_text_extractor()
 
     @text_extractor.setter
     def text_extractor(self, extractor: TextExtractor | None):
-        self._text_extractor = (
-            extractor if extractor is not None else MarkItDownTextExtractor()
-        )
+        self._text_extractor = extractor
 
     def _raise_for_status(self, response: httpx.Response) -> None:
         if not response.is_error:
@@ -506,24 +614,19 @@ class GlanosClient:
             response=response,
         )
 
-    def _request(
+    def _url(self, path: str) -> str:
+        return f"{self.base_url}{API_BASE_PATH}{path}"
+
+    def _api_request(
         self,
         method: str,
         url: str,
         params: dict | None = None,
         json_body: dict | None = None,
-    ) -> httpx.Response:
-        kwargs: dict = {}
-        if params is not None:
-            kwargs["params"] = params
-        if json_body is not None:
-            kwargs["content"] = json.dumps(json_body)
-            kwargs["headers"] = {"Content-Type": "application/json"}
-
-        response = self.client.request(method, url, **kwargs)
-        self._raise_for_status(response)
-
-        return response
+    ) -> _ApiRequest:
+        return _ApiRequest(
+            method, url, {"token": self.token, **(params or {})}, json_body
+        )
 
     @staticmethod
     def _to_json_dict(model: BaseModel) -> dict:
@@ -576,7 +679,7 @@ class GlanosClient:
         settings: AnonymizationSettings | None = None,
         settings_id: str | None = None,
         session: str | None = None,
-        session_max_age: int | None = None,
+        session_max_age_ms: int | None = None,
         language: str | None = None,
         data_retention_ms: int | None = None,
         pseudo_key_retention_ms: int | None = None,
@@ -585,6 +688,11 @@ class GlanosClient:
         assigned_group: str | None = None,
         options: list[str] | None = None,
     ) -> dict:
+        if settings is not None and settings_id is not None:
+            raise ValueError(
+                "Pass either 'settings' or 'settings_id', not both (the API would "
+                "ignore 'settings_id')"
+            )
 
         upload = ApiUploadDocument(
             data=base64.b64encode(input_data.content).decode("utf-8")
@@ -600,7 +708,7 @@ class GlanosClient:
             assignee=assignee,
             assignedGroup=assigned_group,
             session=session,
-            sessionMaxAge=session_max_age,
+            sessionMaxAge=session_max_age_ms,
             options=options,
         )
 
@@ -609,96 +717,112 @@ class GlanosClient:
             body["settings"] = self._inline_settings_body(settings)
         return body
 
-    def pseudo_sync(
+    def _pseudo_request(
         self,
-        text: str | None = None,
-        path: str | Path | None = None,
-        filename: str | None = None,
-        settings: AnonymizationSettings | None = None,
-        settings_id: str | None = None,
-        session: str | None = None,
-        session_max_age: int | None = None,
+        input_data: InputData,
         *,
-        data: bytes | None = None,
-        a_sync: bool | None = None,
+        server_async: bool,
         return_pseudo_key: bool | None = None,
         return_encrypt_key: bool | None = None,
-        language: str | None = None,
-        data_retention_ms: int | None = None,
-        pseudo_key_retention_ms: int | None = None,
-        meta_retention_ms: int | None = None,
-        assignee: str | None = None,
-        assigned_group: str | None = None,
-        options: list[str] | None = None,
-    ) -> PseudoResult:
-
-        if a_sync and (return_pseudo_key or return_encrypt_key):
-            raise ValueError(
-                "Invalid parameter combination: return_pseudo_key/return_encrypt_key "
-                "require a synchronous request, since keys are only available on the "
-                "completed result."
-            )
-        if not a_sync:
-            return_pseudo_key, return_encrypt_key = _default_keys(
+        **body_options,
+    ) -> _ApiRequest:
+        params = {"async": str(server_async).lower()}
+        # An asynchronous request gets its keys from the fetch request.
+        if not server_async:
+            want_pseudo_key, want_encrypt_key = _default_keys(
                 return_pseudo_key, return_encrypt_key
             )
+            params["returnPseudoKey"] = str(want_pseudo_key).lower()
+            params["returnEncryptKey"] = str(want_encrypt_key).lower()
 
-        input_data = _input_data(text, path, data, filename)
-
-        params = {"token": self.token}
-        for name, value in (
-            ("async", a_sync),
-            ("returnPseudoKey", return_pseudo_key),
-            ("returnEncryptKey", return_encrypt_key),
-        ):
-            if value is not None:
-                params[name] = str(value).lower()
-
-        request_body = self.build_pseudo_request_body(
-            input_data=input_data,
-            settings=settings,
-            settings_id=settings_id,
-            session=session,
-            session_max_age=session_max_age,
-            language=language,
-            data_retention_ms=data_retention_ms,
-            pseudo_key_retention_ms=pseudo_key_retention_ms,
-            meta_retention_ms=meta_retention_ms,
-            assignee=assignee,
-            assigned_group=assigned_group,
-            options=options,
-        )
-
-        response = self._request(
+        return self._api_request(
             "POST",
             self.build_pseudo_request_url(),
-            params=params,
-            json_body=request_body,
+            params,
+            self.build_pseudo_request_body(input_data, **body_options),
         )
 
-        return self._parse_pseudo_response(response)
+    @staticmethod
+    def _anonymize_plan(
+        processing: Processing | str | None,
+        input_data: InputData,
+        poll_interval: float | None,
+        max_attempts: int | None,
+        return_pseudo_key: bool | None,
+        return_encrypt_key: bool | None,
+    ) -> tuple[Processing, dict | None]:
+        """Check the options of anonymize() before anything is sent.
+
+        Returns the processing and, for "poll", the arguments for fetch().
+        """
+        if processing is None:
+            # A text is usually done within one request, a document may take
+            # longer.
+            processing = (
+                Processing.SYNC if input_data.source == "string" else Processing.POLL
+            )
+        processing = Processing(processing)
+
+        if processing is not Processing.POLL:
+            if poll_interval is not None or max_attempts is not None:
+                raise ValueError(
+                    "poll_interval and max_attempts only apply to processing='poll'"
+                )
+            if processing is Processing.NO_WAIT and (
+                return_pseudo_key is not None or return_encrypt_key is not None
+            ):
+                raise ValueError(
+                    "With processing='no_wait' the keys are requested when the "
+                    "result is collected: pass return_pseudo_key/return_encrypt_key "
+                    "to fetch()"
+                )
+            return processing, None
+
+        want_pseudo_key, want_encrypt_key = _default_keys(
+            return_pseudo_key, return_encrypt_key
+        )
+        polling = {
+            "poll_interval": DEFAULT_POLL_INTERVAL
+            if poll_interval is None
+            else poll_interval,
+            "max_attempts": DEFAULT_POLL_MAX_ATTEMPTS
+            if max_attempts is None
+            else max_attempts,
+            "return_pseudo_key": want_pseudo_key,
+            "return_encrypt_key": want_encrypt_key,
+        }
+        _check_polling(polling["poll_interval"], polling["max_attempts"])
+        return processing, polling
+
+    def _review_request(
+        self,
+        input_data: InputData,
+        assignee: str | None,
+        assigned_group: str | None,
+        **body_options,
+    ) -> _ApiRequest:
+        if bool(assignee) == bool(assigned_group):
+            raise ValueError("Pass either 'assignee' or 'assigned_group' (exactly one)")
+        return self._pseudo_request(
+            input_data,
+            server_async=True,
+            assignee=assignee,
+            assigned_group=assigned_group,
+            **body_options,
+        )
 
     def build_fetch_request_url(self) -> str:
         return f"{self.base_url}{API_BASE_PATH}/document/pseudo/fetch"
 
-    def fetch(
+    def _fetch_request(
         self,
-        pseudo_result: PseudoResult,
-        max_retries: int = DEFAULT_FETCH_MAX_RETRIES,
-        poll_interval: tuple[float, float] = DEFAULT_FETCH_POLL_INTERVAL,
-        start_retention_period: bool = True,
-        download_options: DownloadOption | None = None,
-        return_pseudo_key: bool = True,
-        return_encrypt_key: bool = True,
-    ) -> PseudoResult:
-
-        if isinstance(pseudo_result.data, InnerResponseData):
-            return pseudo_result
-
-        fetch_key = pseudo_result.data.fetchKey
-        url = self.build_fetch_request_url()
+        fetch_key: str,
+        start_retention_period: bool,
+        download_options: DownloadOption | None,
+        return_pseudo_key: bool,
+        return_encrypt_key: bool,
+    ) -> _ApiRequest:
         params = {
-            "token": self.token,
             "fetchKey": fetch_key,
             "returnPseudoKey": str(return_pseudo_key).lower(),
             "returnEncryptKey": str(return_encrypt_key).lower(),
@@ -706,86 +830,22 @@ class GlanosClient:
         }
         if download_options is not None:
             params["downloadOptions"] = download_options.value
+        return self._api_request("GET", self.build_fetch_request_url(), params)
 
-        for _ in range(max_retries):
-            response = self._request("GET", url, params=params)
-            pseudo_result = self._parse_pseudo_response(response)
+    @staticmethod
+    def _pending_fetch_key(pending: AnonymizationResult | str) -> str | None:
+        if isinstance(pending, str):
+            return pending
+        return None if pending.ready else pending.fetch_key
 
-            if isinstance(pseudo_result.data, InnerResponseData):
-                return pseudo_result
+    @staticmethod
+    def _note_fetch_key(exc: Exception, fetch_key: str) -> None:
+        # Polling stops at the first error; the fetch key lets the caller
+        # pick it up again.
+        exc.add_note(f"fetch_key: {fetch_key} (pass it to fetch() to try again)")
 
-            time.sleep(random.uniform(*poll_interval))
-
-        raise FetchTimeoutError(
-            f"Anonymization result not ready after {max_retries} attempts "
-            f"(fetchKey={fetch_key})"
-        )
-
-    def get_ano_result(self, pseudo_result: PseudoResult) -> AnonymizationResult:
-
-        data = pseudo_result.data
-        if not isinstance(data, InnerResponseData):
-            raise ValueError(
-                "pseudo_result does not contain a completed result; call fetch() first"
-            )
-
-        if _is_plain_text(data):
-            text_content = base64.b64decode(data.data).decode("utf-8")
-        else:
-            text_content = self.text_extractor.extract_text(pseudo_result)
-
-        return AnonymizationResult(text_content, pseudo_result)
-
-    def write_to_output(
-        self,
-        data: str | bytes,
-        output_file: str | Path,
-        extension: str | None = None,
-        mode: str = "w",
-    ) -> None:
-
-        path = Path(output_file)
-        if extension:
-            path = path.with_suffix(f".{extension}")
-
-        with open(path, mode=mode) as f:
-            f.write(data)
-
-    def manage_data(
-        self, pseudo_result: PseudoResult, output_file: str | Path | None = None
-    ) -> None:
-
-        if not isinstance(pseudo_result.data, InnerResponseData):
-            print(
-                "Document accepted but not yet processed. Use the fetch key together "
-                "with the fetch script to request the anonymized document again",
-                file=sys.stderr,
-            )
-            print(pseudo_result.data.model_dump_json())
-            return
-
-        content = base64.b64decode(pseudo_result.data.data)
-        content_length = len(content)
-
-        self.write_to_output(content, output_file=output_file, mode="wb")
-
-        mk = pseudo_result.data.metaKey
-        print(f"metaKey: {mk}")
-        print(f"fileName: {pseudo_result.data.fileName}")
-        if pseudo_result.data.session is not None:
-            print(f"session: {pseudo_result.data.session}")
-
-        pk = pseudo_result.data.pseudoKey
-        if pk is not None:
-            print(f"pseudoKey: {pk}")
-            self.write_to_output(pk, output_file=output_file, extension="pkey")
-
-        ek = pseudo_result.data.encryptKey
-        if ek is not None:
-            print(f"encryptKey: {ek}")
-            self.write_to_output(ek, output_file=output_file, extension="ekey")
-
-        print(f"{output_file} (SZ: {content_length})")
+    def _result(self, pseudo_result: PseudoResult) -> AnonymizationResult:
+        return AnonymizationResult(pseudo_result, self._text_extractor)
 
     def build_depseudo_request_url(self) -> str:
         return f"{self.base_url}{API_BASE_PATH}/document/depseudo"
@@ -835,161 +895,72 @@ class GlanosClient:
 
         return self._to_json_dict(upload)
 
-    def depseudo(
-        self,
-        path: str | Path | None = None,
-        depseudo_paths: DepseudoPaths | None = None,
-        session: str | None = None,
-        output_mode: OutputMode = OutputMode.JSON,
-        filename: str | None = None,
-        text: str | None = None,
-        *,
-        data: bytes | None = None,
-    ) -> PseudoResult:
-
-        input_data = _input_data(text, path, data, filename)
-
-        return self._send_depseudo(input_data, depseudo_paths, session, output_mode)
-
-    def _send_depseudo(
+    def _depseudo_request(
         self,
         input_data: InputData,
         depseudo_paths: DepseudoPaths | None,
         session: str | None,
-        output_mode: OutputMode = OutputMode.JSON,
-    ) -> PseudoResult:
-        request_body = self.build_depseudo_request_body(
-            input_data=input_data, depseudo_paths=depseudo_paths, session=session
-        )
-        params = {"token": self.token, "outputMode": output_mode.value}
-
-        response = self._request(
+    ) -> _ApiRequest:
+        return self._api_request(
             "POST",
             self.build_depseudo_request_url(),
-            params=params,
-            json_body=request_body,
+            {"outputMode": "json"},
+            self.build_depseudo_request_body(
+                input_data=input_data, depseudo_paths=depseudo_paths, session=session
+            ),
         )
 
-        return self._parse_pseudo_response(response)
-
-    def deanonymize(
+    def _deanonymize_request(
         self,
-        result: AnonymizationResult | PseudoResult,
-        *,
-        session: str | None = None,
-        depseudo_paths: DepseudoPaths | None = None,
-    ) -> DeanonymizationResult:
-        pseudo_result = (
-            result.pseudo_result if isinstance(result, AnonymizationResult) else result
-        )
-        data = pseudo_result.data
-        if not isinstance(data, InnerResponseData):
-            raise ValueError(
-                "result does not contain a completed result; call fetch() first"
+        result: AnonymizationResult | None,
+        text: str | None,
+        path: str | Path | None,
+        data: bytes | None,
+        filename: str | None,
+        session: str | None,
+        depseudo_paths: DepseudoPaths | None,
+    ) -> _ApiRequest:
+        if result is None:
+            if session is None and depseudo_paths is None:
+                raise ValueError(
+                    "Restoring 'text', 'path' or 'data' needs a 'session' or the "
+                    "keys ('depseudo_paths')"
+                )
+            return self._depseudo_request(
+                _input_data(text, path, data, filename), depseudo_paths, session
             )
 
+        if any(value is not None for value in (text, path, data, filename)):
+            raise ValueError(
+                "Pass either a result or 'text'/'path'/'data' to restore, not both"
+            )
+        completed = result._completed_data()
         if session is None and depseudo_paths is None:
             try:
-                depseudo_paths = DepseudoPaths.from_result(pseudo_result)
+                depseudo_paths = DepseudoPaths.from_result(result.pseudo_result)
             except ValueError:
-                if not data.session:
+                if not completed.session:
                     raise
-                session = data.session
+                session = completed.session
 
-        content = base64.b64decode(data.data)
-        if _is_plain_text(data):
+        content = base64.b64decode(completed.data)
+        if _is_plain_text(completed):
             input_data = InputData(
-                content=content.decode("utf-8"), source="string", filename=data.fileName
+                content=content.decode("utf-8"),
+                source="string",
+                filename=completed.fileName,
             )
         else:
             input_data = InputData(
-                content=content, source="file", filename=data.fileName
+                content=content, source="file", filename=completed.fileName
             )
-        restored = self._send_depseudo(input_data, depseudo_paths, session)
-        restored_data = restored.data
-        if not isinstance(restored_data, InnerResponseData):
+        return self._depseudo_request(input_data, depseudo_paths, session)
+
+    def _deanonymization_result(self, restored: PseudoResult) -> DeanonymizationResult:
+        if not isinstance(restored.data, InnerResponseData):
             raise ValueError("depseudo did not return a completed result")
 
-        if Path(restored_data.fileName).suffix.lower() == ".txt":
-            text = base64.b64decode(restored_data.data).decode("utf-8")
-        else:
-            text = self.text_extractor.extract_text(restored)
-        return DeanonymizationResult(text, restored)
-
-    def depseudo_text(
-        self,
-        text: str,
-        session: str | None = None,
-        depseudo_paths: DepseudoPaths | None = None,
-        filename: str | None = None,
-    ) -> str:
-
-        result = self.depseudo(
-            text=text, session=session, depseudo_paths=depseudo_paths, filename=filename
-        )
-        if not isinstance(result.data, InnerResponseData):
-            raise ValueError("depseudo did not return a completed result")
-
-        return base64.b64decode(result.data.data).decode("utf-8")
-
-    def anonymize(
-        self,
-        text: str | None = None,
-        path: str | Path | None = None,
-        filename: str | None = None,
-        settings: AnonymizationSettings | None = None,
-        settings_id: str | None = None,
-        session: str | None = None,
-        session_max_age: int | None = None,
-        *,
-        data: bytes | None = None,
-        a_sync: bool | None = None,
-        return_pseudo_key: bool | None = None,
-        return_encrypt_key: bool | None = None,
-        language: str | None = None,
-        data_retention_ms: int | None = None,
-        pseudo_key_retention_ms: int | None = None,
-        meta_retention_ms: int | None = None,
-        assignee: str | None = None,
-        assigned_group: str | None = None,
-        options: list[str] | None = None,
-    ) -> AnonymizationResult:
-
-        pseudo_result = self.pseudo_sync(
-            text=text,
-            path=path,
-            filename=filename,
-            data=data,
-            settings=settings,
-            settings_id=settings_id,
-            session=session,
-            session_max_age=session_max_age,
-            a_sync=a_sync,
-            return_pseudo_key=return_pseudo_key,
-            return_encrypt_key=return_encrypt_key,
-            language=language,
-            data_retention_ms=data_retention_ms,
-            pseudo_key_retention_ms=pseudo_key_retention_ms,
-            meta_retention_ms=meta_retention_ms,
-            assignee=assignee,
-            assigned_group=assigned_group,
-            options=options,
-        )
-
-        if a_sync:
-            fetch_pseudo_result = self.fetch(pseudo_result)
-        else:
-            want_pseudo_key, want_encrypt_key = _default_keys(
-                return_pseudo_key, return_encrypt_key
-            )
-            fetch_pseudo_result = self.fetch(
-                pseudo_result,
-                return_pseudo_key=want_pseudo_key,
-                return_encrypt_key=want_encrypt_key,
-            )
-        anonymization_result = self.get_ano_result(fetch_pseudo_result)
-
-        return anonymization_result
+        return DeanonymizationResult(restored, self._text_extractor)
 
     @staticmethod
     def _parse_session_response(response: httpx.Response) -> SessionInfo:
@@ -1000,15 +971,18 @@ class GlanosClient:
             )
         return SessionInfo.model_validate(_unwrap_data_envelope(body))
 
-    def add_session(
+    @staticmethod
+    def _parse_success(response: httpx.Response) -> SuccessMessage:
+        return SuccessMessage.model_validate(response.json())
+
+    def _add_session_request(
         self,
         max_age_seconds: int,
-        *,
         settings_id: str,
-        name: str | None = None,
-        share_users: list[str] | None = None,
-        share_groups: list[str] | None = None,
-    ) -> SessionInfo:
+        name: str | None,
+        share_users: list[str] | None,
+        share_groups: list[str] | None,
+    ) -> _ApiRequest:
         body = AnonymizationSessionAddData(
             name=name,
             settingsId=settings_id,
@@ -1016,86 +990,62 @@ class GlanosClient:
             shareGroups=share_groups,
             sessionMaxAge=max_age_seconds,
         )
-        response = self._request(
-            "POST",
-            f"{self.base_url}{API_BASE_PATH}/session/add",
-            params={"token": self.token},
-            json_body=self._to_json_dict(body),
+        return self._api_request(
+            "POST", self._url("/session/add"), json_body=self._to_json_dict(body)
         )
-        return self._parse_session_response(response)
 
-    def _start_session(
-        self,
-        max_age_ms: int,
-        settings: AnonymizationSettings | None = None,
-        settings_id: str | None = None,
-    ) -> str:
-        if settings_id is not None:
-            return self.add_session(
-                max_age_seconds=max(1, math.ceil(max_age_ms / 1000)),
-                settings_id=settings_id,
-            ).id
+    @staticmethod
+    def _session_max_age_seconds(max_age_ms: int) -> int:
+        return max(1, math.ceil(max_age_ms / 1000))
 
-        result = self.fetch(
-            self.pseudo_sync(text=".", settings=settings, session_max_age=max_age_ms)
-        )
-        session_id = (
-            result.data.session if isinstance(result.data, InnerResponseData) else None
-        )
-        if not session_id:
+    @staticmethod
+    def _session_of(result: AnonymizationResult) -> str:
+        if not result.session:
             raise GlanosClientError(
-                "Glanos anonymization.ai did not return a session id despite session_max_age being set"
+                "Glanos anonymization.ai did not return a session id despite session_max_age_ms being set"
             )
-        return session_id
+        return result.session
 
-    def get_session(self, session_id: str) -> SessionInfo:
-        response = self._request(
-            "GET",
-            f"{self.base_url}{API_BASE_PATH}/session/get",
-            params={"token": self.token, "session": session_id},
+    def _get_session_request(self, session_id: str) -> _ApiRequest:
+        return self._api_request(
+            "GET", self._url("/session/get"), {"session": session_id}
         )
-        return self._parse_session_response(response)
 
-    def extend_session(self, session_id: str, max_age_seconds: int) -> SessionInfo:
-        response = self._request(
-            "GET",
-            f"{self.base_url}{API_BASE_PATH}/session/extend",
-            params={
-                "token": self.token,
-                "session": session_id,
-                "sessionMaxAge": max_age_seconds,
-            },
-        )
-        return self._parse_session_response(response)
-
-    def remove_session(self, session_id: str) -> SuccessMessage:
-        response = self._request(
+    def _extend_session_request(
+        self, session_id: str, max_age_seconds: int
+    ) -> _ApiRequest:
+        return self._api_request(
             "PUT",
-            f"{self.base_url}{API_BASE_PATH}/session/remove",
-            params={"token": self.token, "session": session_id},
+            self._url("/session/extend"),
+            {"session": session_id, "sessionMaxAge": max_age_seconds},
         )
-        return SuccessMessage.model_validate(response.json())
 
-    def get_setting(self, setting_id: str) -> AnonymizationSettings:
-        response = self._request(
-            "GET",
-            f"{self.base_url}{API_BASE_PATH}/setting/get",
-            params={"token": self.token, "setting": setting_id},
+    def _remove_session_request(self, session_id: str) -> _ApiRequest:
+        return self._api_request(
+            "PUT", self._url("/session/remove"), {"session": session_id}
         )
+
+    @staticmethod
+    def _parse_setting(response: httpx.Response) -> AnonymizationSettings:
         return AnonymizationSettings.model_validate(
             _unwrap_data_envelope(response.json())
         )
 
-    def list_settings(
+    def _get_setting_request(self, setting_id: str) -> _ApiRequest:
+        return self._api_request(
+            "GET", self._url("/setting/get"), {"setting": setting_id}
+        )
+
+    def _list_settings_request(
         self,
-        query: str | None = None,
-        creator: str | list[str] | None = None,
-        sort: SettingsSort | None = None,
-        sort_order: SortOrder | None = None,
-        limit: int | None = None,
-        offset: int | None = None,
-    ) -> AnonymizationSettingsList:
-        params: dict = {"token": self.token}
+        query: str | None,
+        creator: str | list[str] | None,
+        sort: SettingsSort | None,
+        sort_order: SortOrder | None,
+        limit: int | None,
+        offset: int | None,
+    ) -> _ApiRequest:
+        params: dict = {}
         if query is not None:
             params["query"] = query
         if creator is not None:
@@ -1111,9 +1061,10 @@ class GlanosClient:
         if offset is not None:
             params["offset"] = offset
 
-        response = self._request(
-            "GET", f"{self.base_url}{API_BASE_PATH}/setting/list", params=params
-        )
+        return self._api_request("GET", self._url("/setting/list"), params)
+
+    @staticmethod
+    def _parse_settings_list(response: httpx.Response) -> AnonymizationSettingsList:
         return AnonymizationSettingsList.model_validate(
             _unwrap_data_envelope(response.json())
         )
@@ -1127,22 +1078,19 @@ class GlanosClient:
             if key in AnonymizationSettings.model_fields
         }
 
-    def _write_setting(
-        self, endpoint: str, body: dict, apply_defaults: bool
-    ) -> AnonymizationSettings:
-        response = self._request(
+    def _write_setting_request(
+        self, endpoint: str, settings: AnonymizationSettings, apply_defaults: bool
+    ) -> _ApiRequest:
+        return self._api_request(
             "POST",
-            f"{self.base_url}{API_BASE_PATH}/setting/{endpoint}",
-            params={"token": self.token, "applyDefaults": str(apply_defaults).lower()},
-            json_body=body,
-        )
-        return AnonymizationSettings.model_validate(
-            _unwrap_data_envelope(response.json())
+            self._url(f"/setting/{endpoint}"),
+            {"applyDefaults": str(apply_defaults).lower()},
+            self._stored_setting_body(settings),
         )
 
-    def add_setting(
-        self, settings: AnonymizationSettings, apply_defaults: bool = True
-    ) -> AnonymizationSettings:
+    def _add_setting_request(
+        self, settings: AnonymizationSettings, apply_defaults: bool
+    ) -> _ApiRequest:
         if settings.id is not None:
             raise ValueError(
                 "add_setting() creates a new setting and the server assigns its id; "
@@ -1151,32 +1099,639 @@ class GlanosClient:
             )
         if not settings.name:
             raise ValueError("A new setting needs a name (settings.name)")
-        return self._write_setting(
-            "add", self._stored_setting_body(settings), apply_defaults
-        )
+        return self._write_setting_request("add", settings, apply_defaults)
 
-    def update_setting(
-        self, settings: AnonymizationSettings, apply_defaults: bool = True
-    ) -> AnonymizationSettings:
+    def _update_setting_request(
+        self, settings: AnonymizationSettings, apply_defaults: bool
+    ) -> _ApiRequest:
         if not settings.id:
             raise ValueError(
                 "update_setting() changes an existing setting and needs its id "
                 "(settings.id); use add_setting() to create a new one"
             )
-        body = self._stored_setting_body(settings)
+        return self._write_setting_request("update", settings, apply_defaults)
+
+    @staticmethod
+    def _setting_not_found(
+        exc: GlanosAPIError, settings: AnonymizationSettings
+    ) -> SettingNotFoundError | None:
+        if (exc.api_message or "").startswith("No such settings"):
+            return SettingNotFoundError(f"No stored setting with id {settings.id!r}")
+        return None
+
+    def _remove_setting_request(self, setting_id: str) -> _ApiRequest:
+        return self._api_request(
+            "PUT", self._url("/setting/remove"), {"setting": setting_id}
+        )
+
+
+class GlanosClient(_GlanosClientBase):
+    """Client for the Glanos anonymization.ai API; every call blocks until done.
+
+    See AsyncGlanosClient for the same API with `async`/`await`.
+    """
+
+    def __init__(
+        self,
+        token: str,
+        base_url: str,
+        text_extractor: TextExtractor | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        transport: httpx.BaseTransport | None = None,
+        no_ssl_verify: bool = False,
+    ) -> None:
+        super().__init__(token, base_url, text_extractor)
+        self._client: httpx.Client | None = httpx.Client(
+            verify=not no_ssl_verify,
+            timeout=timeout,
+            transport=transport,
+        )
+
+    def __enter__(self) -> "GlanosClient":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    @property
+    def client(self) -> httpx.Client:
+        return self._client
+
+    def _send(self, request: _ApiRequest) -> httpx.Response:
+        response = self.client.request(
+            request.method, request.url, **request.httpx_kwargs()
+        )
+        self._raise_for_status(response)
+        return response
+
+    def anonymize(
+        self,
+        text: str | None = None,
+        path: str | Path | None = None,
+        filename: str | None = None,
+        settings: AnonymizationSettings | None = None,
+        settings_id: str | None = None,
+        session: str | None = None,
+        session_max_age_ms: int | None = None,
+        *,
+        data: bytes | None = None,
+        processing: Processing | str | None = None,
+        poll_interval: float | None = None,
+        max_attempts: int | None = None,
+        return_pseudo_key: bool | None = None,
+        return_encrypt_key: bool | None = None,
+        language: str | None = None,
+        data_retention_ms: int | None = None,
+        pseudo_key_retention_ms: int | None = None,
+        meta_retention_ms: int | None = None,
+        options: list[str] | None = None,
+    ) -> AnonymizationResult:
+        """Anonymize a text or a document.
+
+        `processing` decides how long to wait for the result (default: "sync"
+        for text, "poll" for documents):
+
+        - "sync": one request that waits for the document.
+        - "poll": submit, then poll every `poll_interval` seconds (default 10),
+          at most `max_attempts` times (default 30). Only these two options
+          are about polling, and they only apply to "poll".
+        - "no_wait": submit and return at once.
+
+        If the document is not ready in time, the result is pending
+        (`result.ready` is False): collect it later with `fetch()` and
+        `result.fetch_key`.
+        """
+        input_data = _input_data(text, path, data, filename)
+        processing, polling = self._anonymize_plan(
+            processing,
+            input_data,
+            poll_interval,
+            max_attempts,
+            return_pseudo_key,
+            return_encrypt_key,
+        )
+        request = self._pseudo_request(
+            input_data,
+            server_async=processing is not Processing.SYNC,
+            return_pseudo_key=return_pseudo_key,
+            return_encrypt_key=return_encrypt_key,
+            settings=settings,
+            settings_id=settings_id,
+            session=session,
+            session_max_age_ms=session_max_age_ms,
+            language=language,
+            data_retention_ms=data_retention_ms,
+            pseudo_key_retention_ms=pseudo_key_retention_ms,
+            meta_retention_ms=meta_retention_ms,
+            options=options,
+        )
+        result = self._result(self._parse_pseudo_response(self._send(request)))
+        if polling is None:
+            return result
+        return self.fetch(result, **polling)
+
+    def anonymize_with_review(
+        self,
+        text: str | None = None,
+        path: str | Path | None = None,
+        filename: str | None = None,
+        settings: AnonymizationSettings | None = None,
+        settings_id: str | None = None,
+        session: str | None = None,
+        session_max_age_ms: int | None = None,
+        *,
+        assignee: str | None = None,
+        assigned_group: str | None = None,
+        data: bytes | None = None,
+        language: str | None = None,
+        data_retention_ms: int | None = None,
+        pseudo_key_retention_ms: int | None = None,
+        meta_retention_ms: int | None = None,
+        options: list[str] | None = None,
+    ) -> AnonymizationResult:
+        """Anonymize a document that a person reviews in the Glanos dashboard.
+
+        Pass exactly one of `assignee` (a user) or `assigned_group` (a group).
+        It returns at once, without polling: the result is pending until the
+        review is done. Collect it with `fetch()` and `result.fetch_key`.
+        """
+        request = self._review_request(
+            _input_data(text, path, data, filename),
+            assignee,
+            assigned_group,
+            settings=settings,
+            settings_id=settings_id,
+            session=session,
+            session_max_age_ms=session_max_age_ms,
+            language=language,
+            data_retention_ms=data_retention_ms,
+            pseudo_key_retention_ms=pseudo_key_retention_ms,
+            meta_retention_ms=meta_retention_ms,
+            options=options,
+        )
+        return self._result(self._parse_pseudo_response(self._send(request)))
+
+    def fetch(
+        self,
+        pending: AnonymizationResult | str,
+        *,
+        poll_interval: float = DEFAULT_FETCH_POLL_INTERVAL,
+        max_attempts: int | None = DEFAULT_FETCH_MAX_ATTEMPTS,
+        start_retention_period: bool = True,
+        download_options: DownloadOption | None = None,
+        return_pseudo_key: bool = True,
+        return_encrypt_key: bool = True,
+    ) -> AnonymizationResult:
+        """Collect a pending result, given as the result or its fetch key.
+
+        Asks every `poll_interval` seconds (default 300, for documents in
+        review) until the document is ready. After `max_attempts` requests
+        (default None: no limit) it returns the result still pending. An error
+        ends the polling; its note carries the fetch key.
+        """
+        fetch_key = self._pending_fetch_key(pending)
+        if fetch_key is None:
+            return pending
+        _check_polling(poll_interval, max_attempts)
+
+        request = self._fetch_request(
+            fetch_key,
+            start_retention_period,
+            download_options,
+            return_pseudo_key,
+            return_encrypt_key,
+        )
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                result = self._result(self._parse_pseudo_response(self._send(request)))
+            except Exception as exc:
+                self._note_fetch_key(exc, fetch_key)
+                raise
+            if result.ready or attempts == max_attempts:
+                return result
+            time.sleep(poll_interval)
+
+    def deanonymize(
+        self,
+        result: AnonymizationResult | None = None,
+        *,
+        text: str | None = None,
+        path: str | Path | None = None,
+        data: bytes | None = None,
+        filename: str | None = None,
+        session: str | None = None,
+        depseudo_paths: DepseudoPaths | None = None,
+    ) -> DeanonymizationResult:
+        """Restore the original values.
+
+        Pass the `result` of anonymize(): its keys (or session) are used unless
+        `session` or `depseudo_paths` is given. Or pass anonymized `text`, a
+        file (`path`) or bytes (`data` with `filename`) together with
+        `session` or `depseudo_paths`.
+        """
+        request = self._deanonymize_request(
+            result, text, path, data, filename, session, depseudo_paths
+        )
+        restored = self._parse_pseudo_response(self._send(request))
+        return self._deanonymization_result(restored)
+
+    def depseudo_text(
+        self,
+        text: str,
+        session: str | None = None,
+        depseudo_paths: DepseudoPaths | None = None,
+    ) -> str:
+        """Restore a text, e.g. a model's reply, and return it as a string."""
+        return self.deanonymize(
+            text=text, session=session, depseudo_paths=depseudo_paths
+        ).extract_text()
+
+    def add_session(
+        self,
+        max_age_seconds: int,
+        *,
+        settings_id: str,
+        name: str | None = None,
+        share_users: list[str] | None = None,
+        share_groups: list[str] | None = None,
+    ) -> SessionInfo:
+        request = self._add_session_request(
+            max_age_seconds, settings_id, name, share_users, share_groups
+        )
+        return self._parse_session_response(self._send(request))
+
+    def _start_session(
+        self,
+        max_age_ms: int,
+        settings: AnonymizationSettings | None = None,
+        settings_id: str | None = None,
+    ) -> str:
+        if settings_id is not None:
+            return self.add_session(
+                self._session_max_age_seconds(max_age_ms), settings_id=settings_id
+            ).id
+
+        result = self.anonymize(
+            text=".",
+            settings=settings,
+            session_max_age_ms=max_age_ms,
+            return_pseudo_key=False,
+            return_encrypt_key=False,
+        )
+        result = self.fetch(result, **self._COLLECT_IN_TIME)
+        return self._session_of(result)
+
+    def get_session(self, session_id: str) -> SessionInfo:
+        request = self._get_session_request(session_id)
+        return self._parse_session_response(self._send(request))
+
+    def extend_session(self, session_id: str, max_age_seconds: int) -> SessionInfo:
+        request = self._extend_session_request(session_id, max_age_seconds)
+        return self._parse_session_response(self._send(request))
+
+    def remove_session(self, session_id: str) -> SuccessMessage:
+        request = self._remove_session_request(session_id)
+        return self._parse_success(self._send(request))
+
+    def get_setting(self, setting_id: str) -> AnonymizationSettings:
+        request = self._get_setting_request(setting_id)
+        return self._parse_setting(self._send(request))
+
+    def list_settings(
+        self,
+        query: str | None = None,
+        creator: str | list[str] | None = None,
+        sort: SettingsSort | None = None,
+        sort_order: SortOrder | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> AnonymizationSettingsList:
+        request = self._list_settings_request(
+            query, creator, sort, sort_order, limit, offset
+        )
+        return self._parse_settings_list(self._send(request))
+
+    def add_setting(
+        self, settings: AnonymizationSettings, apply_defaults: bool = True
+    ) -> AnonymizationSettings:
+        request = self._add_setting_request(settings, apply_defaults)
+        return self._parse_setting(self._send(request))
+
+    def update_setting(
+        self, settings: AnonymizationSettings, apply_defaults: bool = True
+    ) -> AnonymizationSettings:
+        request = self._update_setting_request(settings, apply_defaults)
         try:
-            return self._write_setting("update", body, apply_defaults)
+            response = self._send(request)
         except GlanosAPIError as exc:
-            if (exc.api_message or "").startswith("No such settings"):
-                raise SettingNotFoundError(
-                    f"No stored setting with id {settings.id!r}"
-                ) from exc
-            raise
+            not_found = self._setting_not_found(exc, settings)
+            if not_found is None:
+                raise
+            raise not_found from exc
+        return self._parse_setting(response)
 
     def remove_setting(self, setting_id: str) -> SuccessMessage:
-        response = self._request(
-            "PUT",
-            f"{self.base_url}{API_BASE_PATH}/setting/remove",
-            params={"token": self.token, "setting": setting_id},
+        request = self._remove_setting_request(setting_id)
+        return self._parse_success(self._send(request))
+
+
+class AsyncGlanosClient(_GlanosClientBase):
+    """Client for the Glanos anonymization.ai API with `async`/`await`.
+
+    The same methods as GlanosClient, as coroutines, built on
+    httpx.AsyncClient: `async with AsyncGlanosClient(...) as client:
+    result = await client.anonymize(text=...)`. Reading input files and
+    `extract_text()` on a result still run synchronously.
+    """
+
+    def __init__(
+        self,
+        token: str,
+        base_url: str,
+        text_extractor: TextExtractor | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        transport: httpx.AsyncBaseTransport | None = None,
+        no_ssl_verify: bool = False,
+    ) -> None:
+        super().__init__(token, base_url, text_extractor)
+        self._client: httpx.AsyncClient | None = httpx.AsyncClient(
+            verify=not no_ssl_verify,
+            timeout=timeout,
+            transport=transport,
         )
-        return SuccessMessage.model_validate(response.json())
+
+    async def __aenter__(self) -> "AsyncGlanosClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        return self._client
+
+    async def _send(self, request: _ApiRequest) -> httpx.Response:
+        response = await self.client.request(
+            request.method, request.url, **request.httpx_kwargs()
+        )
+        self._raise_for_status(response)
+        return response
+
+    async def anonymize(
+        self,
+        text: str | None = None,
+        path: str | Path | None = None,
+        filename: str | None = None,
+        settings: AnonymizationSettings | None = None,
+        settings_id: str | None = None,
+        session: str | None = None,
+        session_max_age_ms: int | None = None,
+        *,
+        data: bytes | None = None,
+        processing: Processing | str | None = None,
+        poll_interval: float | None = None,
+        max_attempts: int | None = None,
+        return_pseudo_key: bool | None = None,
+        return_encrypt_key: bool | None = None,
+        language: str | None = None,
+        data_retention_ms: int | None = None,
+        pseudo_key_retention_ms: int | None = None,
+        meta_retention_ms: int | None = None,
+        options: list[str] | None = None,
+    ) -> AnonymizationResult:
+        """Anonymize a text or a document; see GlanosClient.anonymize()."""
+        input_data = _input_data(text, path, data, filename)
+        processing, polling = self._anonymize_plan(
+            processing,
+            input_data,
+            poll_interval,
+            max_attempts,
+            return_pseudo_key,
+            return_encrypt_key,
+        )
+        request = self._pseudo_request(
+            input_data,
+            server_async=processing is not Processing.SYNC,
+            return_pseudo_key=return_pseudo_key,
+            return_encrypt_key=return_encrypt_key,
+            settings=settings,
+            settings_id=settings_id,
+            session=session,
+            session_max_age_ms=session_max_age_ms,
+            language=language,
+            data_retention_ms=data_retention_ms,
+            pseudo_key_retention_ms=pseudo_key_retention_ms,
+            meta_retention_ms=meta_retention_ms,
+            options=options,
+        )
+        result = self._result(self._parse_pseudo_response(await self._send(request)))
+        if polling is None:
+            return result
+        return await self.fetch(result, **polling)
+
+    async def anonymize_with_review(
+        self,
+        text: str | None = None,
+        path: str | Path | None = None,
+        filename: str | None = None,
+        settings: AnonymizationSettings | None = None,
+        settings_id: str | None = None,
+        session: str | None = None,
+        session_max_age_ms: int | None = None,
+        *,
+        assignee: str | None = None,
+        assigned_group: str | None = None,
+        data: bytes | None = None,
+        language: str | None = None,
+        data_retention_ms: int | None = None,
+        pseudo_key_retention_ms: int | None = None,
+        meta_retention_ms: int | None = None,
+        options: list[str] | None = None,
+    ) -> AnonymizationResult:
+        """Anonymize a document for review; see GlanosClient.anonymize_with_review()."""
+        request = self._review_request(
+            _input_data(text, path, data, filename),
+            assignee,
+            assigned_group,
+            settings=settings,
+            settings_id=settings_id,
+            session=session,
+            session_max_age_ms=session_max_age_ms,
+            language=language,
+            data_retention_ms=data_retention_ms,
+            pseudo_key_retention_ms=pseudo_key_retention_ms,
+            meta_retention_ms=meta_retention_ms,
+            options=options,
+        )
+        return self._result(self._parse_pseudo_response(await self._send(request)))
+
+    async def fetch(
+        self,
+        pending: AnonymizationResult | str,
+        *,
+        poll_interval: float = DEFAULT_FETCH_POLL_INTERVAL,
+        max_attempts: int | None = DEFAULT_FETCH_MAX_ATTEMPTS,
+        start_retention_period: bool = True,
+        download_options: DownloadOption | None = None,
+        return_pseudo_key: bool = True,
+        return_encrypt_key: bool = True,
+    ) -> AnonymizationResult:
+        """Collect a pending result; see GlanosClient.fetch()."""
+        fetch_key = self._pending_fetch_key(pending)
+        if fetch_key is None:
+            return pending
+        _check_polling(poll_interval, max_attempts)
+
+        request = self._fetch_request(
+            fetch_key,
+            start_retention_period,
+            download_options,
+            return_pseudo_key,
+            return_encrypt_key,
+        )
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                result = self._result(
+                    self._parse_pseudo_response(await self._send(request))
+                )
+            except Exception as exc:
+                self._note_fetch_key(exc, fetch_key)
+                raise
+            if result.ready or attempts == max_attempts:
+                return result
+            await asyncio.sleep(poll_interval)
+
+    async def deanonymize(
+        self,
+        result: AnonymizationResult | None = None,
+        *,
+        text: str | None = None,
+        path: str | Path | None = None,
+        data: bytes | None = None,
+        filename: str | None = None,
+        session: str | None = None,
+        depseudo_paths: DepseudoPaths | None = None,
+    ) -> DeanonymizationResult:
+        """Restore the original values; see GlanosClient.deanonymize()."""
+        request = self._deanonymize_request(
+            result, text, path, data, filename, session, depseudo_paths
+        )
+        restored = self._parse_pseudo_response(await self._send(request))
+        return self._deanonymization_result(restored)
+
+    async def depseudo_text(
+        self,
+        text: str,
+        session: str | None = None,
+        depseudo_paths: DepseudoPaths | None = None,
+    ) -> str:
+        """Restore a text; see GlanosClient.depseudo_text()."""
+        restored = await self.deanonymize(
+            text=text, session=session, depseudo_paths=depseudo_paths
+        )
+        return restored.extract_text()
+
+    async def add_session(
+        self,
+        max_age_seconds: int,
+        *,
+        settings_id: str,
+        name: str | None = None,
+        share_users: list[str] | None = None,
+        share_groups: list[str] | None = None,
+    ) -> SessionInfo:
+        request = self._add_session_request(
+            max_age_seconds, settings_id, name, share_users, share_groups
+        )
+        return self._parse_session_response(await self._send(request))
+
+    async def _start_session(
+        self,
+        max_age_ms: int,
+        settings: AnonymizationSettings | None = None,
+        settings_id: str | None = None,
+    ) -> str:
+        if settings_id is not None:
+            session = await self.add_session(
+                self._session_max_age_seconds(max_age_ms), settings_id=settings_id
+            )
+            return session.id
+
+        result = await self.anonymize(
+            text=".",
+            settings=settings,
+            session_max_age_ms=max_age_ms,
+            return_pseudo_key=False,
+            return_encrypt_key=False,
+        )
+        result = await self.fetch(result, **self._COLLECT_IN_TIME)
+        return self._session_of(result)
+
+    async def get_session(self, session_id: str) -> SessionInfo:
+        request = self._get_session_request(session_id)
+        return self._parse_session_response(await self._send(request))
+
+    async def extend_session(
+        self, session_id: str, max_age_seconds: int
+    ) -> SessionInfo:
+        request = self._extend_session_request(session_id, max_age_seconds)
+        return self._parse_session_response(await self._send(request))
+
+    async def remove_session(self, session_id: str) -> SuccessMessage:
+        request = self._remove_session_request(session_id)
+        return self._parse_success(await self._send(request))
+
+    async def get_setting(self, setting_id: str) -> AnonymizationSettings:
+        request = self._get_setting_request(setting_id)
+        return self._parse_setting(await self._send(request))
+
+    async def list_settings(
+        self,
+        query: str | None = None,
+        creator: str | list[str] | None = None,
+        sort: SettingsSort | None = None,
+        sort_order: SortOrder | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> AnonymizationSettingsList:
+        request = self._list_settings_request(
+            query, creator, sort, sort_order, limit, offset
+        )
+        return self._parse_settings_list(await self._send(request))
+
+    async def add_setting(
+        self, settings: AnonymizationSettings, apply_defaults: bool = True
+    ) -> AnonymizationSettings:
+        request = self._add_setting_request(settings, apply_defaults)
+        return self._parse_setting(await self._send(request))
+
+    async def update_setting(
+        self, settings: AnonymizationSettings, apply_defaults: bool = True
+    ) -> AnonymizationSettings:
+        request = self._update_setting_request(settings, apply_defaults)
+        try:
+            response = await self._send(request)
+        except GlanosAPIError as exc:
+            not_found = self._setting_not_found(exc, settings)
+            if not_found is None:
+                raise
+            raise not_found from exc
+        return self._parse_setting(response)
+
+    async def remove_setting(self, setting_id: str) -> SuccessMessage:
+        request = self._remove_setting_request(setting_id)
+        return self._parse_success(await self._send(request))

@@ -107,7 +107,7 @@ class TestPseudoCommand:
         body = json.loads(recorder.requests[0].content)
         assert body["fileName"] == "input.txt"
 
-    def test_async_prints_raw_json_without_writing_file(
+    def test_no_wait_prints_raw_json_without_writing_file(
         self, patch_http, capsys, tmp_path, accepted_pseudo_response_json
     ):
         recorder = RequestRecorder(
@@ -125,7 +125,8 @@ class TestPseudoCommand:
                 "https://x.test",
                 "--text",
                 "hi",
-                "--async",
+                "--processing",
+                "no_wait",
                 "--outputFile",
                 str(out),
             ]
@@ -133,6 +134,70 @@ class TestPseudoCommand:
 
         assert not out.exists()
         assert "fetchKey" in capsys.readouterr().out
+        assert recorder.requests[0].url.params["async"] == "true"
+
+    def test_poll_prints_the_fetch_key_when_out_of_attempts(
+        self, patch_http, capsys, tmp_path, accepted_pseudo_response_json
+    ):
+        recorder = RequestRecorder(
+            [httpx.Response(202, json=accepted_pseudo_response_json)]
+        )
+        patch_http(recorder)
+        out = tmp_path / "out.txt"
+
+        cli.main(
+            [
+                "pseudo",
+                "--token",
+                "tok",
+                "--baseUrl",
+                "https://x.test",
+                "--file",
+                __file__,
+                "--pollInterval",
+                "0",
+                "--maxAttempts",
+                "2",
+                "--outputFile",
+                str(out),
+            ]
+        )
+
+        assert not out.exists()
+        captured = capsys.readouterr()
+        assert "fetch-abc-123" in captured.out
+        assert "fetch --fetchKey fetch-abc-123" in captured.err
+        # one submission and two checks
+        assert len(recorder.requests) == 3
+
+    def test_assignee_submits_for_review_and_prints_the_fetch_key(
+        self, patch_http, capsys, accepted_pseudo_response_json
+    ):
+        recorder = RequestRecorder(
+            [httpx.Response(202, json=accepted_pseudo_response_json)]
+        )
+        patch_http(recorder)
+
+        cli.main(
+            [
+                "pseudo",
+                "--token",
+                "tok",
+                "--baseUrl",
+                "https://x.test",
+                "--file",
+                __file__,
+                "--assignee",
+                "anna@example.com",
+            ]
+        )
+
+        assert "fetch-abc-123" in capsys.readouterr().out
+        assert len(recorder.requests) == 1
+        assert recorder.requests[0].url.params["async"] == "true"
+        assert json.loads(recorder.requests[0].content)["assignee"] == (
+            "anna@example.com"
+        )
 
     def test_quota_exceeded_exits_with_error_on_stderr(
         self, patch_http, capsys, tmp_path
@@ -157,6 +222,122 @@ class TestPseudoCommand:
         assert exc_info.value.code == 1
         stderr = capsys.readouterr().err
         assert "quota exceeded" in stderr.lower() or "402" in stderr
+
+    def test_settings_flags_are_sent_as_inline_settings(
+        self, patch_http, tmp_path, completed_pseudo_response_json
+    ):
+        recorder = RequestRecorder(
+            [httpx.Response(200, json=completed_pseudo_response_json)]
+        )
+        patch_http(recorder)
+
+        cli.main(
+            [
+                "pseudo",
+                "--token",
+                "tok",
+                "--baseUrl",
+                "https://x.test",
+                "--text",
+                "hi",
+                "--outputFile",
+                str(tmp_path / "out.txt"),
+                "--mode",
+                "TYPE_PRESERVING",
+                "--excludeFields",
+                "dates",
+            ]
+        )
+
+        body = json.loads(recorder.requests[0].content)
+        assert body["settings"]["mode"] == "TYPE_PRESERVING"
+        assert body["settings"]["excludeFields"] == ["dates"]
+        assert "settingsId" not in body
+
+    def test_settings_flags_together_with_settings_id_fail_without_a_request(
+        self, patch_http, capsys, tmp_path
+    ):
+        recorder = RequestRecorder([httpx.Response(200, json={})])
+        patch_http(recorder)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(
+                [
+                    "pseudo",
+                    "--token",
+                    "tok",
+                    "--baseUrl",
+                    "https://x.test",
+                    "--text",
+                    "hi",
+                    "--outputFile",
+                    str(tmp_path / "out.txt"),
+                    "--mode",
+                    "XXX",
+                    "--settingsId",
+                    "set-1",
+                ]
+            )
+
+        assert exc_info.value.code == 1
+        assert "settings_id" in capsys.readouterr().err
+        assert recorder.requests == []
+
+    def test_without_settings_flags_no_settings_are_sent(
+        self, patch_http, tmp_path, completed_pseudo_response_json
+    ):
+        recorder = RequestRecorder(
+            [httpx.Response(200, json=completed_pseudo_response_json)]
+        )
+        patch_http(recorder)
+
+        cli.main(
+            [
+                "pseudo",
+                "--token",
+                "tok",
+                "--baseUrl",
+                "https://x.test",
+                "--text",
+                "hi",
+                "--outputFile",
+                str(tmp_path / "out.txt"),
+            ]
+        )
+
+        assert "settings" not in json.loads(recorder.requests[0].content)
+
+    def test_sync_pseudo_requests_and_writes_both_keys_by_default(
+        self, patch_http, tmp_path, completed_pseudo_response_json
+    ):
+        completed_pseudo_response_json["data"].update(
+            pseudoKey="pk-value", encryptKey="ek-value"
+        )
+        recorder = RequestRecorder(
+            [httpx.Response(200, json=completed_pseudo_response_json)]
+        )
+        patch_http(recorder)
+        out = tmp_path / "anonymized.txt"
+
+        cli.main(
+            [
+                "pseudo",
+                "--token",
+                "tok",
+                "--baseUrl",
+                "https://x.test",
+                "--text",
+                "hi",
+                "--outputFile",
+                str(out),
+            ]
+        )
+
+        params = recorder.requests[0].url.params
+        assert params["returnPseudoKey"] == "true"
+        assert params["returnEncryptKey"] == "true"
+        assert (tmp_path / "anonymized.pkey").read_text() == "pk-value"
+        assert (tmp_path / "anonymized.ekey").read_text() == "ek-value"
 
 
 class TestFetchCommand:
@@ -185,6 +366,38 @@ class TestFetchCommand:
 
         assert out.exists()
         assert recorder.requests[0].url.params["fetchKey"] == "fk-1"
+
+    def test_fetch_polls_with_the_given_interval_and_attempts(
+        self, patch_http, monkeypatch, capsys, tmp_path, accepted_pseudo_response_json
+    ):
+        sleeps: list[float] = []
+        monkeypatch.setattr("glanos_anonymization.core.time.sleep", sleeps.append)
+        recorder = RequestRecorder(
+            [httpx.Response(202, json=accepted_pseudo_response_json)]
+        )
+        patch_http(recorder)
+
+        cli.main(
+            [
+                "fetch",
+                "--token",
+                "tok",
+                "--baseUrl",
+                "https://x.test",
+                "--fetchKey",
+                "fetch-abc-123",
+                "--pollInterval",
+                "60",
+                "--maxAttempts",
+                "3",
+                "--outputFile",
+                str(tmp_path / "out.txt"),
+            ]
+        )
+
+        assert len(recorder.requests) == 3
+        assert sleeps == [60.0, 60.0]
+        assert "fetch-abc-123" in capsys.readouterr().out
 
 
 class TestDepseudoCommand:
@@ -308,3 +521,76 @@ class TestSessionRemoveCommand:
 
         out = json.loads(capsys.readouterr().out)
         assert out["success"] is True
+
+
+class TestSettingUpdateCommand:
+    def test_reads_the_setting_and_sends_it_back_complete(self, patch_http, capsys):
+        stored = {
+            "id": "set-1",
+            "name": "Legal DE",
+            "mode": "TYPE_PRESERVING",
+            "excludeFields": ["dates"],
+        }
+        recorder = RequestRecorder(
+            [
+                httpx.Response(200, json={"success": True, "data": stored}),
+                httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {**stored, "excludeFields": ["locations"]},
+                    },
+                ),
+            ]
+        )
+        patch_http(recorder)
+
+        cli.main(
+            [
+                "setting-update",
+                "--token",
+                "tok",
+                "--baseUrl",
+                "https://x.test",
+                "--setting",
+                "set-1",
+                "--excludeFields",
+                "locations",
+            ]
+        )
+
+        get_request, update_request = recorder.requests
+        assert get_request.url.path == "/be/api-v2/setting/get"
+        assert update_request.url.path == "/be/api-v2/setting/update"
+        body = json.loads(update_request.content)
+        assert body["id"] == "set-1"
+        assert body["name"] == "Legal DE"
+        assert body["mode"] == "TYPE_PRESERVING"
+        assert body["excludeFields"] == ["locations"]
+        assert json.loads(capsys.readouterr().out)["excludeFields"] == ["locations"]
+
+
+class TestSessionAddCommand:
+    def test_prints_the_created_session(self, patch_http, capsys):
+        recorder = RequestRecorder(
+            [httpx.Response(200, json={"success": True, "data": {"id": "sess-1"}})]
+        )
+        patch_http(recorder)
+
+        cli.main(
+            [
+                "session-add",
+                "--token",
+                "tok",
+                "--baseUrl",
+                "https://x.test",
+                "--settingsId",
+                "set-1",
+                "--maxAgeSeconds",
+                "3600",
+            ]
+        )
+
+        body = json.loads(recorder.requests[0].content)
+        assert body == {"settingsId": "set-1", "sessionMaxAge": 3600}
+        assert json.loads(capsys.readouterr().out)["id"] == "sess-1"

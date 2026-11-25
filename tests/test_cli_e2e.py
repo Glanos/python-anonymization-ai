@@ -19,10 +19,13 @@ from glanos_anonymization import cli
 GLANOS_API_KEY = os.environ.get("GLANOS_TOKEN", "")
 GLANOS_BASE_URL = os.environ.get("GLANOS_BASE_URL", "")
 
+# fetch waits 5 minutes between checks by default, for reviews
+QUICK_FETCH = ["--pollInterval", "1", "--maxAttempts", "60"]
+
 requires_credentials = [
     pytest.mark.e2e,
     pytest.mark.skipif(
-        not GLANOS_API_KEY, reason="GLANOS_API_KEY not set - skipping e2e tests"
+        not GLANOS_API_KEY, reason="GLANOS_TOKEN not set - skipping e2e tests"
     ),
     pytest.mark.skipif(
         not GLANOS_BASE_URL, reason="GLANOS_BASE_URL not set - skipping e2e tests"
@@ -70,14 +73,15 @@ class TestPseudoDepseudoRoundTripViaCli:
         assert out.exists()
         captured = capsys.readouterr()
         assert "metaKey:" in captured.out
-        assert "pseudoKey:" in captured.out
-        assert "encryptKey:" in captured.out
-        assert (tmp_path / "anonymized.pkey").exists()
+        pseudo_key_file = tmp_path / "anonymized.pkey"
+        assert f"pseudoKey written to {pseudo_key_file}" in captured.out
+        # the key itself is only in the file, never on stdout
+        assert pseudo_key_file.read_text() not in captured.out
         # Note: the real API does not always return encryptKey even when
         # --returnEncryptKey is passed, so anonymized.ekey is not guaranteed
         # to exist - not asserted here.
 
-    def test_async_pseudo_then_fetch(self, tmp_path, capsys):
+    def test_no_wait_pseudo_then_fetch(self, tmp_path, capsys):
         cli.main(
             [
                 "pseudo",
@@ -87,7 +91,8 @@ class TestPseudoDepseudoRoundTripViaCli:
                 GLANOS_BASE_URL,
                 "--text",
                 "Mein Name ist Michael Huber",
-                "--async",
+                "--processing",
+                "no_wait",
             ]
         )
         submitted = json.loads(capsys.readouterr().out)
@@ -103,6 +108,7 @@ class TestPseudoDepseudoRoundTripViaCli:
                 GLANOS_BASE_URL,
                 "--fetchKey",
                 fetch_key,
+                *QUICK_FETCH,
                 "--outputFile",
                 str(fetch_out),
             ]
@@ -127,7 +133,8 @@ class TestPseudoDepseudoRoundTripViaCli:
                 GLANOS_BASE_URL,
                 "--text",
                 "Mein Name ist Michael Huber",
-                "--async",
+                "--processing",
+                "no_wait",
                 "--pseudoKeyRetentionMS",
                 "60000",
                 "--metaRetentionMS",
@@ -146,20 +153,14 @@ class TestPseudoDepseudoRoundTripViaCli:
                 GLANOS_BASE_URL,
                 "--fetchKey",
                 fetch_key,
+                *QUICK_FETCH,
                 "--outputFile",
                 str(anonymized),
             ]
         )
         printed_lines = capsys.readouterr().out.splitlines()
         meta_key = (
-            next(l for l in printed_lines if l.startswith("metaKey:"))
-            .split(":", 1)[1]
-            .strip()
-        )
-        # The API tracks the document by the fileName it originally assigned,
-        # not the local --outputFile name, so it must be echoed back exactly.
-        server_file_name = (
-            next(l for l in printed_lines if l.startswith("fileName:"))
+            next(line for line in printed_lines if line.startswith("metaKey:"))
             .split(":", 1)[1]
             .strip()
         )
@@ -176,8 +177,6 @@ class TestPseudoDepseudoRoundTripViaCli:
                 str(anonymized),
                 "--metaKey",
                 meta_key,
-                "--filename",
-                server_file_name,
                 "--outputFile",
                 str(depseudo_out),
             ]
@@ -209,7 +208,7 @@ class TestSessionRemoveViaCli:
         )
         printed_lines = capsys.readouterr().out.splitlines()
         session_id = (
-            next(l for l in printed_lines if l.startswith("session:"))
+            next(line for line in printed_lines if line.startswith("session:"))
             .split(":", 1)[1]
             .strip()
         )
